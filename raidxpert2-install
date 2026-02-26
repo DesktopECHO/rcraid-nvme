@@ -1,0 +1,646 @@
+#!/bin/bash
+#
+# raidxpert2-install — Build and install a patched AMD RAIDXpert2 DKMS package.
+# Detects RPM (Fedora/RHEL) or DEB (Debian/Ubuntu) and produces the right package.
+# Usage: ./raidxpert2-install
+#
+set -euo pipefail
+
+# ── Constants ────────────────────────────────────────────────────
+DKMS_NAME="rcraid"
+DKMS_VER="9.3.3"
+PKG_NAME="rcraid-nvme"
+PKG_VERSION="1"
+PKG_RELEASE="1"
+UPSTREAM_RPM_NAME="raidxpert2-9.3.3_00302-1.x86_64.rpm"
+
+# ── Detect distribution ──────────────────────────────────────────
+if command -v apt-get >/dev/null 2>&1; then
+    DISTRO="deb"
+elif command -v dnf >/dev/null 2>&1; then
+    DISTRO="rpm"
+else
+    echo "Neither apt-get nor dnf found — assuming RPM (live CD fallback)"
+    DISTRO="rpm"
+fi
+echo "Detected: $DISTRO-based distribution"
+
+# ── Escalate to root ─────────────────────────────────────────────
+if [ "$EUID" -ne 0 ]; then
+    echo "Re-running with sudo..."
+    exec sudo "$0" "$@"
+fi
+
+# ── Resolve paths ────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+UPSTREAM_RPM="$SCRIPT_DIR/$UPSTREAM_RPM_NAME"
+if [ ! -f "$UPSTREAM_RPM" ]; then
+    echo "$UPSTREAM_RPM_NAME not found — downloading..."
+    curl -fL -o "$UPSTREAM_RPM" \
+        "https://github.com/DesktopECHO/rcraid-nvme/raw/refs/heads/main/$UPSTREAM_RPM_NAME"
+    [ -f "$UPSTREAM_RPM" ] || { echo "ERROR: download failed"; exit 1; }
+fi
+
+KVER="$(uname -r)"
+WORK="$(mktemp -d /tmp/rcraid-build.XXXX)"
+trap 'rm -rf "$WORK"' EXIT
+echo "Working in $WORK"
+
+# ════════════════════════════════════════════════════════════════════
+# 1.  Build dependencies
+# ════════════════════════════════════════════════════════════════════
+echo "Checking build dependencies..."
+if [ "$DISTRO" = "deb" ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends \
+        build-essential dwarves fakeroot dpkg-dev rpm2cpio cpio \
+        dkms kmod python3 initramfs-tools "linux-headers-$KVER"
+else
+    NEED=()
+    command -v rpmbuild  >/dev/null || NEED+=(rpm-build)
+    command -v python3   >/dev/null || NEED+=(python3)
+    command -v cpio      >/dev/null || NEED+=(cpio)
+    rpm -q system-rpm-config   >/dev/null 2>&1 || NEED+=(system-rpm-config)
+    (( ${#NEED[@]} )) && dnf install -y --setopt=install_weak_deps=False fuse-libs kernel-devel-$(uname -r) "${NEED[@]}"
+fi
+
+# ════════════════════════════════════════════════════════════════════
+# 2.  Extract upstream RPM
+# ════════════════════════════════════════════════════════════════════
+echo "Extracting upstream RPM..."
+mkdir -p "$WORK/original"
+( cd "$WORK/original" && rpm2cpio "$UPSTREAM_RPM" | cpio -idm --quiet )
+
+ROOT="$WORK/root"
+cp -a "$WORK/original" "$ROOT"
+
+SRC="$ROOT/usr/src/$DKMS_NAME-$DKMS_VER/src"
+SDK="$ROOT/usr/src/$DKMS_NAME-$DKMS_VER"
+
+# ════════════════════════════════════════════════════════════════════
+# 3.  Patch binary blob
+# ════════════════════════════════════════════════════════════════════
+echo "Selecting v2 blob..."
+rm -f "$SRC/rcblob.x86_64"
+ln -sf rcblob_v2.x86_64 "$SRC/rcblob.x86_64.o"
+
+# Patch GetLicenseLevel so NVMe RAID works on Ryzen APUs.
+#
+#   v2 .text section starts at file offset 0x90.
+#   GetLicenseLevel symbol is at .text+0xc50 → file offset 0xce0.
+#   First 4 bytes are endbr64 (f3 0f 1e fa) which we preserve.
+#   Patch at 0xce4: mov eax, 0x2a030000 ; ret ; nop×4
+#
+#   Return value 0x2a030000:
+#     - Top byte 0x2a passes the license-family check in DiscoverAdapter.
+#     - Sub-type 0x03 maps to feature mask 0x01ff (RAID 0/1/10 access).
+#       (Sub-type 0x14 gives 0x0400 — too restrictive for array ops.)
+echo "Patching v2 blob (GetLicenseLevel @ 0xce4)..."
+python3 -c "
+with open('$SRC/rcblob_v2.x86_64', 'r+b') as f:
+    f.seek(0xce4)
+    f.write(bytes([
+        0xb8, 0x00, 0x00, 0x03, 0x2a,   # mov eax, 0x2a030000
+        0xc3,                             # ret
+        0x90, 0x90, 0x90, 0x90            # nop padding
+    ]))
+    # Read back and verify
+    f.seek(0xce0)
+    got = f.read(10)
+    expect = bytes([
+        0xf3, 0x0f, 0x1e, 0xfa,          # endbr64 (preserved)
+        0xb8, 0x00, 0x00, 0x03, 0x2a,    # mov eax, 0x2a030000
+        0xc3                              # ret
+    ])
+    assert got == expect, f'Patch verification failed: {got.hex()}'
+print('  Blob patch verified OK')
+"
+
+# ════════════════════════════════════════════════════════════════════
+# 4.  Patch C source and Makefile
+# ════════════════════════════════════════════════════════════════════
+echo "Patching source files..."
+
+# register_sysctl → register_sysctl_sz (removed in 6.11+)
+sed -i 's/register_sysctl("rcraid", rcraid_table)/register_sysctl_sz("rcraid", rcraid_table, ARRAY_SIZE(rcraid_table) - 1)/' \
+    "$SRC/rc_init.c"
+
+# NVMe VID/DID fallback for APU platforms
+grep -q 'orig_device_id = AMD_NVME_DID' "$SRC/rc_init.c" ||
+sed -i '/RC_Unmap_VidDid.*orig_vendor_id.*orig_device_id/a\
+\
+    if (hw->orig_vendor_id == 0 \&\& hw->orig_device_id == 0 \&\&\
+        id->vendor == 0x1022 \&\& id->device == AMD_NVME_DID) {\
+        hw->orig_vendor_id = 0x1022;\
+        hw->orig_device_id = AMD_NVME_DID;\
+        rc_printk(RC_WARN, RC_DRIVER_NAME ": %s AMD NVMe "\
+                  "on bus %d slot %d, VID/DID %04x/%04x\\n",\
+                  __FUNCTION__, hw->pci_bus, hw->pci_slot,\
+                  hw->orig_vendor_id, hw->orig_device_id);\
+    }' "$SRC/rc_init.c"
+
+# EXTRA_CFLAGS → ccflags-y
+sed -i 's/EXTRA_CFLAGS/ccflags-y/g' "$SRC/Makefile"
+
+# mk_certs: fix typo + add Fedora/Debian sign-file paths
+sed -i 's/-outform DEV/-outform DER/g' "$SDK/mk_certs"
+sed -i 's|if \[ -f "/usr/src/linux-headers-\$KVERS/scripts/sign-file" \]; then|if [ -f "/usr/src/linux-headers-$KVERS/scripts/sign-file" ]; then\n\t\tSIGN_TOOL=/usr/src/linux-headers/$KVERS/scripts/sign-file\n\t    elif [ -f "/usr/src/kernels/$KVERS/scripts/sign-file" ]; then|g' "$SDK/mk_certs"
+
+# Makefile: replace blob-selection case with v2 symlink, remove redhat-release guards
+
+echo "Patching Makefile..."
+python3 - "$SRC/Makefile" << 'PYEOF'
+import re, sys
+
+with open(sys.argv[1]) as f:
+    mk = f.read()
+
+mk = re.sub(
+    r'\t@case "\$\(KVERS\)".*?esac',
+    '\t@ln -sf rcblob_v2.x86_64 rcblob.x86_64.o',
+    mk, flags=re.DOTALL
+)
+mk = re.sub(
+    r'\t@if \[ ! -e /etc/redhat-release \]; then\s*\\?\n(.*?)\t fi',
+    lambda m: m.group(1).rstrip(),
+    mk, flags=re.DOTALL
+)
+
+with open(sys.argv[1], 'w') as f:
+    f.write(mk)
+PYEOF
+echo "  Makefile patched OK"
+
+# ════════════════════════════════════════════════════════════════════
+# 5.  Write DKMS metadata
+# ════════════════════════════════════════════════════════════════════
+echo "Writing DKMS files..."
+
+# --- dkms.conf ---
+# MAKE wraps the real make in a subshell with a trap so that the
+# pahole symlink (set up by pre_build.sh) is always restored, even
+# when the build fails.
+cat > "$SDK/dkms.conf" << 'DKMSEOF'
+PACKAGE_NAME="rcraid"
+PACKAGE_VERSION="9.3.3"
+BUILT_MODULE_NAME[0]="rcraid"
+BUILT_MODULE_LOCATION[0]="src"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/scsi"
+AUTOINSTALL="yes"
+SIGN="no"
+PRE_BUILD="pre_build.sh $kernelver"
+MAKE[0]="bash -c 'restore_pahole() { if [ -f /usr/bin/pahole.real ]; then mv /usr/bin/pahole.real /usr/bin/pahole; elif [ -L /usr/bin/pahole ]; then rm -f /usr/bin/pahole; fi; }; trap restore_pahole EXIT; make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build/src modules'"
+DKMSEOF
+
+# --- pre_build.sh ---
+cat > "$SDK/pre_build.sh" << 'PREBUILD'
+#!/bin/bash
+set -euo pipefail
+KVER="${1:?pre_build.sh requires a kernel version argument}"
+DIR="$(dirname "$0")/src"
+cd "$DIR"
+
+# Parse major.minor
+KMAJ="${KVER%%.*}"
+KMIN="${KVER#*.}"; KMIN="${KMIN%%.*}"
+echo "pre_build.sh: kernel $KVER (major=$KMAJ minor=$KMIN)"
+
+# --- Clean previous build ---
+for d in "/usr/src/linux-headers-$KVER" "/usr/src/kernels/$KVER" "/lib/modules/$KVER/build"; do
+    [ -d "$d" ] && { make -C "$d" M="$DIR" clean 2>/dev/null || true; break; }
+done
+
+# --- Symlink blob ---
+ln -sf rcblob_v2.x86_64 rcblob.x86_64.o
+
+# --- pahole workaround (kernel ≤ 6.12) ---
+# On older kernels the BTF pass invokes pahole and fails on this module.
+# We swap pahole with /bin/true before the build.  The MAKE[0] trap in
+# dkms.conf restores it afterward regardless of build success/failure.
+if [ "$KMAJ" -lt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -le 12 ]; }; then
+    PAHOLE="$(command -v pahole 2>/dev/null || true)"
+    if [ -n "$PAHOLE" ] && [ ! -L "$PAHOLE" ]; then
+        echo "  pahole workaround: $PAHOLE → /bin/true (kernel ≤ 6.12)"
+        mv "$PAHOLE" "${PAHOLE}.real"
+        ln -sf /bin/true "$PAHOLE"
+    fi
+fi
+
+# --- Timer API (kernel ≥ 6.13) ---
+if [ "$KMAJ" -gt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -ge 13 ]; }; then
+    grep -ql '\bfrom_timer\b' rc_init.c rc_msg.c 2>/dev/null &&
+        sed -i 's/\bfrom_timer\b/timer_container_of/g' rc_init.c rc_msg.c
+    grep -ql '\bdel_timer_sync\b' rc_msg.c 2>/dev/null &&
+        sed -i 's/\bdel_timer_sync\b/timer_delete_sync/g' rc_msg.c
+else
+    grep -ql '\btimer_container_of\b' rc_init.c rc_msg.c 2>/dev/null &&
+        sed -i 's/\btimer_container_of\b/from_timer/g' rc_init.c rc_msg.c
+    grep -ql '\btimer_delete_sync\b' rc_msg.c 2>/dev/null &&
+        sed -i 's/\btimer_delete_sync\b/del_timer_sync/g' rc_msg.c
+fi
+
+# --- bios_param signature (kernel ≥ 6.18) ---
+if [ "$KMAJ" -gt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -ge 18 ]; }; then
+    grep -q 'struct block_device \*bdev' rc_init.c &&
+        sed -i 's/struct block_device \*bdev/struct gendisk *disk/g' rc_init.c
+else
+    grep -q 'struct gendisk \*disk' rc_init.c &&
+        sed -i 's/struct gendisk \*disk/struct block_device *bdev/g' rc_init.c
+fi
+
+echo "pre_build.sh: done"
+PREBUILD
+chmod +x "$SDK/pre_build.sh"
+
+# ════════════════════════════════════════════════════════════════════
+# 6.  Write shared DKMS lifecycle script
+# ════════════════════════════════════════════════════════════════════
+# Both RPM %post/%preun and DEB postinst/prerm delegate to this script
+# so the logic lives in exactly one place.
+cat > "$SDK/rcraid-dkms.sh" << 'LIFECYCLE'
+#!/bin/bash
+# rcraid-dkms.sh — shared DKMS lifecycle handler
+# Called by package postinst / prerm scripts.
+# Usage: rcraid-dkms.sh  install | remove
+set -e
+
+ACTION="${1:?Usage: rcraid-dkms.sh install|remove}"
+DKMS_NAME="rcraid"
+DKMS_VER="9.3.3"
+KVER="$(uname -r)"
+
+# Detect initramfs tool
+if command -v dracut >/dev/null 2>&1; then
+    regen_initramfs() { dracut --force "/boot/initramfs-${KVER}.img" "$KVER" 2>&1 || true; }
+elif command -v update-initramfs >/dev/null 2>&1; then
+    regen_initramfs() { update-initramfs -u -k "$KVER" 2>&1 || true; }
+else
+    regen_initramfs() { echo "  WARNING: no initramfs tool found"; }
+fi
+
+# Detect header directory
+find_headers() {
+    for d in "/usr/src/linux-headers-$KVER" "/usr/src/kernels/$KVER" "/lib/modules/$KVER/build"; do
+        [ -d "$d" ] && return 0
+    done
+    return 1
+}
+
+case "$ACTION" in
+install)
+    echo "rcraid: configuring DKMS module for kernel $KVER ..."
+
+    if ! find_headers; then
+        echo "  WARNING: kernel headers for $KVER not found."
+        echo "  Install them, then run:  dkms install $DKMS_NAME/$DKMS_VER -k $KVER"
+    fi
+
+    # Clear stale DKMS state
+    if dkms status "$DKMS_NAME/$DKMS_VER" 2>/dev/null | grep -q "$DKMS_NAME"; then
+        dkms remove "$DKMS_NAME/$DKMS_VER" --all 2>/dev/null || true
+    fi
+
+    echo "  dkms add $DKMS_NAME/$DKMS_VER"
+    dkms add "$DKMS_NAME/$DKMS_VER" 2>&1
+
+    echo "  dkms build $DKMS_NAME/$DKMS_VER -k $KVER"
+    if ! dkms build "$DKMS_NAME/$DKMS_VER" -k "$KVER" 2>&1; then
+        echo "ERROR: DKMS build failed — see /var/lib/dkms/$DKMS_NAME/$DKMS_VER/build/make.log"
+        exit 1
+    fi
+
+    echo "  dkms install $DKMS_NAME/$DKMS_VER -k $KVER"
+    if ! dkms install "$DKMS_NAME/$DKMS_VER" -k "$KVER" 2>&1; then
+        MOD="/var/lib/dkms/$DKMS_NAME/$DKMS_VER/build/src/rcraid.ko"
+        if [ -f "$MOD" ]; then
+            echo "  WARNING: dkms install failed — copying module manually"
+            mkdir -p "/lib/modules/$KVER/kernel/drivers/scsi"
+            cp "$MOD" "/lib/modules/$KVER/kernel/drivers/scsi/"
+            depmod -a "$KVER" 2>/dev/null || true
+        else
+            echo "ERROR: module not found after build"
+            exit 1
+        fi
+    fi
+
+    echo "  Loading rcraid..."
+    modprobe rcraid 2>/dev/null || true
+    if lsmod | grep -q '^rcraid '; then
+        echo "  rcraid loaded"
+    else
+        echo "  rcraid installed — will load on next boot"
+    fi
+
+    echo "  Regenerating initramfs..."
+    regen_initramfs
+    echo "rcraid: done"
+    ;;
+
+remove)
+    echo "rcraid: removing DKMS module..."
+    lsmod | grep -q '^rcraid ' && modprobe -r rcraid 2>/dev/null || true
+    dkms remove "$DKMS_NAME/$DKMS_VER" --all 2>/dev/null || true
+    echo "  Regenerating initramfs..."
+    regen_initramfs
+    echo "rcraid: removed"
+    ;;
+
+*)
+    echo "Usage: rcraid-dkms.sh install|remove" >&2
+    exit 1
+    ;;
+esac
+LIFECYCLE
+chmod +x "$SDK/rcraid-dkms.sh"
+
+# ════════════════════════════════════════════════════════════════════
+# 7.  Initramfs configuration (distro-specific)
+# ════════════════════════════════════════════════════════════════════
+if [ "$DISTRO" = "rpm" ]; then
+    mkdir -p "$ROOT/etc/dracut.conf.d"
+    cat > "$ROOT/etc/dracut.conf.d/90-rcraid.conf" << 'EOF'
+add_drivers+=" rcraid "
+EOF
+
+    mkdir -p "$ROOT/usr/lib/dracut/modules.d/90rcraid"
+    cat > "$ROOT/usr/lib/dracut/modules.d/90rcraid/module-setup.sh" << 'EOF'
+#!/bin/bash
+check()         { return 0; }
+depends()       { return 0; }
+install()       { instmods rcraid; }
+installkernel() { instmods rcraid; }
+EOF
+    chmod +x "$ROOT/usr/lib/dracut/modules.d/90rcraid/module-setup.sh"
+
+elif [ "$DISTRO" = "deb" ]; then
+    mkdir -p "$ROOT/etc/initramfs-tools/hooks"
+    cat > "$ROOT/etc/initramfs-tools/hooks/rcraid" << 'EOF'
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+. /usr/share/initramfs-tools/hook-functions
+manual_add_modules rcraid
+EOF
+    chmod +x "$ROOT/etc/initramfs-tools/hooks/rcraid"
+
+    mkdir -p "$ROOT/etc/modules-load.d"
+    echo "rcraid" > "$ROOT/etc/modules-load.d/rcraid.conf"
+
+    # Remove Fedora-specific dracut files from the upstream RPM
+    rm -rf "$ROOT/etc/dracut.conf.d" "$ROOT/usr/lib/dracut"
+fi
+
+# ════════════════════════════════════════════════════════════════════
+# 8.  Clean extracted cruft
+# ════════════════════════════════════════════════════════════════════
+rm -rf "$ROOT/usr/lib/.build-id"
+
+# ════════════════════════════════════════════════════════════════════
+# 9.  Build the package
+# ════════════════════════════════════════════════════════════════════
+echo ""
+echo "Building $DISTRO package..."
+
+if [ "$DISTRO" = "rpm" ]; then
+    # ── RPM ──────────────────────────────────────────────────────
+    RPMBUILD="$WORK/rpmbuild"
+    mkdir -p "$RPMBUILD"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+    cp -a "$ROOT"/* "$RPMBUILD/SOURCES/"
+
+    cat > "$RPMBUILD/SPECS/${PKG_NAME}.spec" << SPECEOF
+Name:           $PKG_NAME
+Version:        $PKG_VERSION
+Release:        ${PKG_RELEASE}%{?dist}
+Summary:        AMD RAIDXpert2 driver patched for modern kernels (DKMS)
+License:        AMD
+URL:            https://www.amd.com/
+Requires:       dkms, kmod, dracut, kernel-devel
+BuildRequires:  rpm-build, python3
+
+%global __strip /bin/true
+%global debug_package %{nil}
+AutoReqProv:    no
+
+%description
+Installs the rcraid 9.3.3 driver source under /usr/src so DKMS can
+automatically build and install the kernel module for each installed
+kernel.  Includes dracut config so the driver is available during
+early boot for AMD RAID arrays.
+
+%prep
+%build
+%install
+mkdir -p %{buildroot}
+cp -a %{_sourcedir}/* %{buildroot}/
+
+%post
+bash /usr/src/$DKMS_NAME-$DKMS_VER/rcraid-dkms.sh install
+
+%preun
+if [ "\$1" = 0 ]; then
+    bash /usr/src/$DKMS_NAME-$DKMS_VER/rcraid-dkms.sh remove
+fi
+
+%files
+%attr(755,root,root) /usr/sbin/RAIDXpert2
+%attr(755,root,root) /usr/sbin/rcadm
+/opt/raidxpert2/RAIDXpert2.pdf
+/usr/share/applications/raidxpert2.desktop
+/usr/share/icons/hicolor/64x64/apps/raidxpert2.png
+/usr/share/polkit-1/actions/com.amd.raidxpert2.policy
+/usr/src/$DKMS_NAME-$DKMS_VER/
+%config(noreplace) /etc/dracut.conf.d/90-rcraid.conf
+/usr/lib/dracut/modules.d/90rcraid/
+
+%changelog
+* Fri Mar 06 2026 Zero <zero@441.surf>
+- Unified build script (RPM + DEB)
+- v2 blob with verified license patch (0xce4, sub-type 0x03)
+- Shared DKMS lifecycle script (rcraid-dkms.sh)
+- pahole workaround with trap-based cleanup
+SPECEOF
+
+    QA_RPATHS=$((0x0001)) rpmbuild \
+        --define "_topdir $RPMBUILD" \
+        --define "_sourcedir $RPMBUILD/SOURCES" \
+        --define "dist %{nil}" \
+        -bb "$RPMBUILD/SPECS/${PKG_NAME}.spec"
+
+    RPM_OUT="$(find "$RPMBUILD/RPMS" -name '*.rpm' | head -1)"
+    [ -f "$RPM_OUT" ] || { echo "ERROR: RPM build failed"; exit 1; }
+    cp "$RPM_OUT" "$SCRIPT_DIR/${PKG_NAME}.x86_64.rpm"
+    PKG_FILE="$SCRIPT_DIR/${PKG_NAME}.x86_64.rpm"
+
+elif [ "$DISTRO" = "deb" ]; then
+    # ── DEB ──────────────────────────────────────────────────────
+    PKG="$WORK/pkg"
+    mkdir -p "$PKG/DEBIAN"
+    cp -a "$ROOT"/* "$PKG/"
+
+    INSTALLED_SIZE=$(du -sk "$PKG" | awk '{print $1}')
+    cat > "$PKG/DEBIAN/control" << EOF
+Package: ${PKG_NAME}
+Version: ${PKG_VERSION}
+Section: admin
+Priority: optional
+Architecture: amd64
+Installed-Size: ${INSTALLED_SIZE}
+Depends: dkms, kmod, initramfs-tools, libfuse2 | libfuse3-3
+Recommends: linux-headers-amd64 | linux-headers-generic
+Maintainer: Zero <zero@441.surf>
+Description: AMD RAIDXpert2 driver patched for modern kernels (DKMS)
+ Installs the rcraid 9.3.3 driver source under /usr/src so DKMS can
+ automatically build and install the kernel module for each installed
+ kernel.  Includes initramfs-tools hook so the driver is available
+ during early boot for AMD RAID arrays.
+EOF
+
+    # All four maintainer scripts just delegate to the shared lifecycle script.
+    cat > "$PKG/DEBIAN/postinst" << 'EOF'
+#!/bin/bash
+set -e
+bash /usr/src/rcraid-9.3.3/rcraid-dkms.sh install
+EOF
+
+    cat > "$PKG/DEBIAN/prerm" << 'EOF'
+#!/bin/bash
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    bash /usr/src/rcraid-9.3.3/rcraid-dkms.sh remove
+fi
+EOF
+
+    cat > "$PKG/DEBIAN/postrm" << 'EOF'
+#!/bin/bash
+set -e
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/dkms/rcraid/9.3.3 2>/dev/null || true
+    rm -rf /usr/src/rcraid-9.3.3       2>/dev/null || true
+fi
+EOF
+
+    chmod 755 "$PKG/DEBIAN"/{postinst,prerm,postrm}
+    fakeroot dpkg-deb --build "$PKG" "$SCRIPT_DIR/${PKG_NAME}-${PKG_VERSION}_amd64.deb"
+    PKG_FILE="$SCRIPT_DIR/${PKG_NAME}-${PKG_VERSION}_amd64.deb"
+fi
+
+# ════════════════════════════════════════════════════════════════════
+# 10.  Install the package
+# ════════════════════════════════════════════════════════════════════
+[ -f "$PKG_FILE" ] || { echo "ERROR: package build failed"; exit 1; }
+
+echo ""
+echo "========================================="
+echo "  Package: $PKG_FILE"
+echo "  Size:    $(du -h "$PKG_FILE" | cut -f1)"
+echo "========================================="
+echo ""
+
+if [ "$DISTRO" = "rpm" ]; then
+    dnf install -y --exclude='kernel-devel' "$PKG_FILE"
+else
+    apt-get install -y "$PKG_FILE"
+fi
+
+# ════════════════════════════════════════════════════════════════════
+# 11.  Live-CD installer flow (wait → chroot → install → reboot)
+# ════════════════════════════════════════════════════════════════════
+# Detect the installer's target mount pattern
+if [ "$DISTRO" = "rpm" ]; then
+    TARGET_PATTERN=" /mnt/sysroot "
+else
+    TARGET_PATTERN=" /tmp/calamares-root-........ "
+fi
+
+cat << 'MSG'
+
+====================================================
+  Proceed with installing Linux to the RAID array.
+  Return to this console when the install is done.
+
+  If you are NOT installing a new copy of Linux,
+  you may close this console and reboot now.
+  The rcraid module will load at startup.
+====================================================
+
+MSG
+
+echo "Waiting for target root filesystem..."
+while ! grep -qE "$TARGET_PATTERN" /proc/mounts 2>/dev/null; do
+    sleep 10
+done
+
+read -r MOUNTED_DEV MOUNTED_AT <<< \
+    "$(grep -E "$TARGET_PATTERN" /proc/mounts | awk '{print $1, $2}' | head -1)"
+echo "Target root: $MOUNTED_AT ($MOUNTED_DEV)"
+sleep 10
+
+cp "$PKG_FILE" "$MOUNTED_AT/"
+echo "Package copied to $MOUNTED_AT/$(basename "$PKG_FILE")"
+
+# Detect EFI partition
+EFI_DEV=""
+if [ -d "$MOUNTED_AT/boot/efi" ]; then
+    EFI_DEV="$(blkid -t TYPE=vfat -o device | grep -v loop | head -1 || true)"
+fi
+
+cat << 'MSG'
+
+============================================
+  Wait for Linux installation to complete
+  but DO NOT REBOOT when it finishes.
+
+  When done, press [Enter] here and the
+  rcraid driver will be installed into
+  the new system on your RAID volume.
+============================================
+MSG
+read -r
+
+# Re-mount if the installer unmounted (Calamares does this)
+if [ "$DISTRO" = "deb" ] && ! mountpoint -q "$MOUNTED_AT" 2>/dev/null; then
+    mount "$MOUNTED_DEV" "$MOUNTED_AT"
+fi
+
+# Bind-mount virtual filesystems for chroot
+for fs in proc sys dev dev/pts; do
+    mkdir -p "$MOUNTED_AT/$fs"
+done
+mount -t proc  proc     "$MOUNTED_AT/proc"
+mount -t sysfs sys      "$MOUNTED_AT/sys"
+mount --bind   /dev     "$MOUNTED_AT/dev"
+mount --bind   /dev/pts "$MOUNTED_AT/dev/pts"
+if [ -n "$EFI_DEV" ] && ! mountpoint -q "$MOUNTED_AT/boot/efi" 2>/dev/null; then
+    mkdir -p "$MOUNTED_AT/boot/efi"
+    mount "$EFI_DEV" "$MOUNTED_AT/boot/efi"
+fi
+
+# Install the package inside the chroot
+PKG_BASENAME="$(basename "$PKG_FILE")"
+if [ "$DISTRO" = "rpm" ]; then
+    chroot "$MOUNTED_AT" /bin/bash -c "
+        dnf install -y fuse-libs kernel-devel-\$(uname -r)
+        dnf install -y --exclude='kernel-devel' /$PKG_BASENAME
+    "
+else
+    chroot "$MOUNTED_AT" /bin/bash -c "
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends dkms dwarves libfuse2 linux-headers-\$(uname -r)
+        dpkg -i -G --force-confnew /$PKG_BASENAME
+    "
+fi
+
+cat << 'MSG'
+
+============================================
+  All steps complete.
+  You must reboot for changes to take effect.
+
+  Press [Enter] to reboot.
+============================================
+MSG
+read -r
+reboot
