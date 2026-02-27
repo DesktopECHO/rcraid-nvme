@@ -1,30 +1,24 @@
-# AMD rcraid Driver Patcher for RHEL 9.x & 10.x
+# AMD rcraid Driver Patcher for RHEL 10.x
 
-This repository contains tools to patch and install the AMD RAIDXpert2 (rcraid) driver on RHEL 9.6+ and RHEL 10.x, where the driver fails to compile due to kernel API changes.
+This repository contains tools to patch and install the AMD RAIDXpert2 (rcraid) driver on modern kernels, where the driver fails to compile due to kernel API changes in the 6.x series.
 
 > **Note:** While this documentation references RHEL, these tools are fully compatible with RHEL derivatives including AlmaLinux, Rocky Linux, and other compatible distributions.
 
-## The Problem
+## The Problem 
 
-AMD's official rcraid driver SDK (version 9.3.3) fails to compile on newer RHEL kernels due to:
+AMD's official rcraid driver (version 9.3.3) fails to compile on modern 6.x kernels, and the following issues require attention:
 
-### RHEL 9.6+ (Kernel 5.14.x)
+1. **NVMe RAID detection** — On Phoenix and newer APUs, the driver fails to identify AMD NVMe controllers when the UEFI variable used for VID/DID mapping is missing, and the binary blob limits functionality when the UEFI `NVME_TRAP_DEVICE` variable is absent.
 
-1. **Removed `linux/genhd.h` header** - This header was merged into `linux/blkdev.h` in newer kernels, and RHEL 9.6+ backported this change.
+2. **Missing `vmalloc.h` include** — The header is no longer implicitly included.
 
-2. **Removed block queue functions** - The functions `blk_queue_max_hw_sectors()` and `blk_queue_virt_boundary()` were removed/changed in the kernel's block layer.
+3. **SCSI API rename** — `slave_configure` was renamed to `sdev_configure`, and the function signature changed to include a `queue_limits` parameter.
 
-3. **Bugs in `mk_certs`** - The AMD signing script has a typo (`-outform DEV` instead of `-outform DER`) and only includes Ubuntu paths, not RHEL paths.
+4. **Block queue API changes** — Functions like `blk_queue_max_hw_sectors()` now use the `queue_limits` struct directly.
 
-### RHEL 10.x (Kernel 6.12.x)
+5. **Sysctl API changes** — `register_sysctl()` requires `register_sysctl_sz()` with explicit size parameter.
 
-4. **Missing `vmalloc.h` include** - The header is no longer implicitly included.
-
-5. **SCSI API rename** - `slave_configure` was renamed to `sdev_configure`, and the function signature changed to include a `queue_limits` parameter.
-
-6. **Block queue API changes** - Functions like `blk_queue_max_hw_sectors()` now use the `queue_limits` struct directly.
-
-7. **Sysctl API changes** - `register_sysctl()` requires `register_sysctl_sz()` with explicit size parameter.
+6. **Bugs in `mk_certs`** — The AMD signing script has a typo (`-outform DEV` instead of `-outform DER`) and only includes Ubuntu paths, not RHEL paths.
 
 ## Repository Contents
 
@@ -55,7 +49,7 @@ sudo dnf install kernel-devel-$(uname -r) gcc make elfutils-libelf-devel openssl
 
 ### Option 1: Simple Patch and Install
 
-This patches the AMD SDK files and runs the original AMD installer. The script automatically detects whether you're running RHEL 9.x or 10.x and applies the appropriate patches:
+This patches the AMD SDK files (including the binary blob and NVMe detection) and runs the original AMD installer:
 
 ```bash
 sudo ./patch_and_install.sh
@@ -70,7 +64,6 @@ sudo ./rcraid_manager.sh
 ```
 
 The manager provides:
-- **Automatic OS/kernel detection** - Detects RHEL 9.x vs 10.x and applies correct patches
 - System status display
 - Full install (patch, build, sign, install, enroll MOK)
 - DKMS setup for automatic rebuilds on kernel updates
@@ -147,12 +140,6 @@ DKMS is available from the EPEL (Extra Packages for Enterprise Linux) repository
 
 For manual installation:
 ```bash
-# RHEL 9.x / AlmaLinux 9 / Rocky 9
-sudo dnf config-manager --set-enabled crb
-sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-sudo dnf install dkms
-
-# RHEL 10.x / AlmaLinux 10 / Rocky 10
 sudo dnf config-manager --set-enabled crb
 sudo dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
 sudo dnf install dkms
@@ -204,9 +191,9 @@ sudo ./rcraid_manager.sh
 
 When building an RPM, you can choose which kernel version to target:
 
-- **Current kernel** - Build for the running kernel (default)
-- **Other installed kernels** - Build for any kernel with kernel-devel installed
-- **Custom kernel** - Manually specify a kernel version
+- **Current kernel** — Build for the running kernel (default)
+- **Other installed kernels** — Build for any kernel with kernel-devel installed
+- **Custom kernel** — Manually specify a kernel version
 
 This is useful when:
 - Creating a driver disk for installation media that uses a different kernel
@@ -224,21 +211,12 @@ sudo ./rcraid_manager.sh
 # Select option 14: "Build Driver Update Disk ISO"
 ```
 
-### ISO Creation Tools
+### ISO Creation
 
-The script automatically uses the appropriate ISO creation tool:
-- **RHEL 10.x**: Uses `xorriso` in native mode (genisoimage is not available)
-- **RHEL 9.x**: Uses `genisoimage` or `mkisofs`
+The script uses `xorriso` in native mode to create the ISO. If needed, install manually:
 
-The xorriso tool is used with its native syntax (not mkisofs emulation) for cleaner output and better compatibility.
-
-If needed, install manually:
 ```bash
-# RHEL 10.x
 sudo dnf install xorriso
-
-# RHEL 9.x
-sudo dnf install genisoimage
 ```
 
 ### Using the Driver Disk
@@ -275,7 +253,7 @@ sudo ./rcraid_manager.sh
 # Reboot and complete enrollment
 ```
 
-### Build fails with "genhd.h: No such file or directory"
+### Build fails with missing header or implicit declaration errors
 
 The patches weren't applied. Run:
 
@@ -285,17 +263,13 @@ sudo ./rcraid_manager.sh
 # Select option 4 to apply patches, then option 5 to build
 ```
 
-### Build fails with "blk_queue_max_hw_sectors" implicit declaration
+### Build fails with "sdev_configure" or "queue_limits" errors
 
-Same as above - patches not applied correctly.
+Make sure you're using the latest `rcraid_manager.sh` which includes all RHEL 10.x patches.
 
-### Build fails with "sdev_configure" or "queue_limits" errors (RHEL 10.x)
+### Build fails with "register_sysctl" errors
 
-Make sure you're using the latest `rcraid_manager.sh` which includes RHEL 10.x patches. The script auto-detects your OS version.
-
-### Build fails with "register_sysctl" errors (RHEL 10.x)
-
-This is fixed in the RHEL 10.x patches. Ensure patches are applied:
+This is fixed in the patches. Ensure patches are applied:
 
 ```bash
 sudo ./rcraid_manager.sh
@@ -338,61 +312,22 @@ This will verify all prerequisites are met before you attempt installation.
 
 | Distribution | Version | Kernel | Status |
 |-------------|---------|--------|--------|
-| RHEL | 9.6+ | 5.14.0-570+ | ✅ Working |
 | RHEL | 10.0+ | 6.12.0+ | ✅ Working |
-| AlmaLinux | 9.6+ | 5.14.0-570+ | ✅ Working |
 | AlmaLinux | 10.0+ | 6.12.0+ | ✅ Working |
-| Rocky Linux | 9.6+ | 5.14.0-570+ | ✅ Expected to work |
 | Rocky Linux | 10.0+ | 6.12.0+ | ✅ Expected to work |
 
 ## Technical Details
 
 ### Patches Applied
 
-#### RHEL 9.x Patches
-
-##### rc_config.c
-
-```c
-// Before (fails on RHEL 9.6+):
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0)
-#include <linux/genhd.h>
-#endif
-
-// After (works on all versions):
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0) && !defined(RHEL_RELEASE_CODE)
-#include <linux/genhd.h>
-#elif defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(9,6)
-#include <linux/genhd.h>
-#endif
-#include <linux/blkdev.h>
-```
-
-##### rc_init.c
-
-```c
-// Before (removed functions):
-blk_queue_max_hw_sectors(sdev->request_queue, 256);
-blk_queue_virt_boundary(sdev->request_queue, NVME_CTRL_PAGE_SIZE - 1);
-
-// After (version-aware):
-#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)
-    sdev->host->max_sectors = 256;
-#else
-    blk_queue_max_hw_sectors(sdev->request_queue, 256);
-#endif
-```
-
-#### RHEL 10.x Patches
-
-##### rc_init.c - vmalloc include
+#### rc_init.c — vmalloc include
 
 ```c
 // Added:
 #include <linux/vmalloc.h>
 ```
 
-##### rc_init.c - SCSI API rename
+#### rc_init.c — SCSI API rename
 
 ```c
 // Before:
@@ -404,7 +339,7 @@ static int rc_slave_cfg(struct scsi_device *sdev);
 static int rc_slave_cfg(struct scsi_device *sdev, struct queue_limits *lim);
 ```
 
-##### rc_init.c - Block queue API
+#### rc_init.c — Block queue API
 
 ```c
 // Before:
@@ -414,7 +349,7 @@ blk_queue_max_hw_sectors(sdev->request_queue, 256);
 lim->max_hw_sectors = 256;
 ```
 
-##### rc_init.c - Sysctl API
+#### rc_init.c — Sysctl API
 
 ```c
 // Before:
@@ -424,14 +359,36 @@ rcraid_sysctl_hdr = register_sysctl("rcraid", rcraid_table);
 rcraid_sysctl_hdr = register_sysctl_sz("rcraid", rcraid_table, ARRAY_SIZE(rcraid_table) - 1);
 ```
 
-#### mk_certs (All versions)
+#### rcblob.x86_64 — GetLicenseLevel patch
+
+```
+Offset 0x12C0: mov eax, 0x2A030000; ret; nop*4
+Bytes:  b8 00 00 03 2a c3 90 90 90 90
+```
+
+Forces the most permissive license tier (feature flags `0x01FF`), enabling all RAID levels and NVMe RAID support regardless of UEFI variable state.
+
+#### rc_init.c — NVMe VID/DID fallback
+
+```c
+// Added after RC_Unmap_VidDid call:
+if (hw->orig_vendor_id == 0 && hw->orig_device_id == 0 &&
+    id->vendor == 0x1022 && id->device == AMD_NVME_DID) {
+    hw->orig_vendor_id = 0x1022;
+    hw->orig_device_id = AMD_NVME_DID;
+}
+```
+
+When the UEFI `NVME_TRAP_DEVICE` variable is absent, `RC_Unmap_VidDid` returns zeros. This fallback detects AMD NVMe controllers (PCI 1022:B000) and sets the correct VID/DID so the driver recognizes them.
+
+#### mk_certs
 
 - Fixed typo: `-outform DEV` → `-outform DER`
 - Added RHEL kernel paths: `/usr/src/kernels/$KVERS/scripts/sign-file`
 
 ## License & Legal
 
-The patch scripts in this repository are licensed under the **MIT License** - see [LICENSE](LICENSE) for details.
+The patch scripts in this repository are licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
 
 **IMPORTANT:** This repository includes AMD's proprietary driver SDK and utilities. Please read [NOTICE.md](NOTICE.md) for important information about:
 - AMD's software licensing terms
@@ -446,6 +403,6 @@ Issues and pull requests welcome! Please test on your specific configuration bef
 
 This is an unofficial community project. AMD does not support, endorse, or take any responsibility for these patches or tools.
 
-The patches modify AMD's proprietary driver source code solely to fix compilation issues on newer kernels. No functional changes are made to the driver itself.
+The patches modify AMD's proprietary driver source code and binary blob solely to fix compilation issues and enable NVMe RAID functionality on RHEL 10.x kernels.
 
 **USE AT YOUR OWN RISK.**

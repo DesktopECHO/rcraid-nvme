@@ -1129,7 +1129,7 @@ rcraid_probe_one(struct pci_dev *dev, const struct pci_device_id *id)
 					 (probe_dev->class == PCI_CLASS_STORAGE_SATA_AHCI)) 
 					 	ahci_count++;
 
-				rc_printk(RC_NOTE, "%s: matched supported adapter - vendor = 0x%x device 0x%x\n", __FUNCTION__,
+				rc_printk(RC_NOTE, "%s: Supported adapter found, Vendor=0x%x Device=0x%x\n", __FUNCTION__,
 					  probe_dev->vendor,
 					  probe_dev->device
 					  );

@@ -1,9 +1,8 @@
 #!/bin/bash
 #
-# AMD rcraid Driver Manager for RHEL 9.x and 10.x
+# AMD rcraid Driver Manager for RHEL 10.x
 # Handles patching, building, signing, DKMS setup, and MOK enrollment
-# Dynamically detects OS version and applies appropriate patches
-# Compatible with RHEL and derivatives (AlmaLinux, Rocky Linux, etc.)
+# Compatible with RHEL 10 and derivatives (AlmaLinux, Rocky Linux, etc.)
 #
 
 set -e
@@ -42,21 +41,21 @@ NC='\033[0m' # No Color
 # OS/Kernel Version Detection
 #######################################
 
-# Detect RHEL major version (9 or 10)
+# Detect RHEL major version
 detect_rhel_version() {
     local rhel_major=0
-    
+
     if [ -f /etc/redhat-release ]; then
         rhel_major=$(grep -oP '(?<=release )\d+' /etc/redhat-release 2>/dev/null | head -1)
     elif [ -f /etc/os-release ]; then
         rhel_major=$(grep -oP '(?<=VERSION_ID=")\d+' /etc/os-release 2>/dev/null | head -1)
     fi
-    
-    # Default to 9 if detection fails
-    if [ -z "$rhel_major" ] || [ "$rhel_major" -lt 9 ]; then
-        rhel_major=9
+
+    # Default to 10 if detection fails
+    if [ -z "$rhel_major" ] || [ "$rhel_major" -lt 10 ]; then
+        rhel_major=10
     fi
-    
+
     echo "$rhel_major"
 }
 
@@ -136,11 +135,8 @@ enable_crb_repo() {
     
     # For AlmaLinux, Rocky, CentOS Stream - use dnf config-manager
     if command -v dnf &> /dev/null; then
-        # Try 'crb' first (EL9+)
+        # Try 'crb' first
         dnf config-manager --set-enabled crb 2>/dev/null && return 0
-        
-        # Try 'powertools' (EL8)
-        dnf config-manager --set-enabled powertools 2>/dev/null && return 0
         
         # Try with full repo name patterns
         local crb_repo=$(dnf repolist --all 2>/dev/null | grep -iE "crb|codeready|powertools" | awk '{print $1}' | head -1)
@@ -166,13 +162,7 @@ install_epel_repo() {
         enable_crb_repo
     fi
     
-    # Determine EPEL URL based on RHEL version
-    local epel_url=""
-    if [ "$RHEL_MAJOR" -ge 10 ]; then
-        epel_url="https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm"
-    else
-        epel_url="https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm"
-    fi
+    local epel_url="https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm"
     
     print_status "Installing from: $epel_url"
     
@@ -266,7 +256,7 @@ print_header() {
     clear
     echo -e "${BLUE}=============================================${NC}"
     echo -e "${BLUE}  AMD rcraid Driver Manager${NC}"
-    echo -e "${BLUE}  RHEL 9.x & 10.x Compatibility Tool${NC}"
+    echo -e "${BLUE}  RHEL 10.x Compatibility Tool${NC}"
     echo -e "${BLUE}=============================================${NC}"
     echo ""
 }
@@ -535,13 +525,6 @@ is_module_signed() {
 }
 
 is_patches_applied() {
-    # Check for EL9 patches
-    if [ -f "$SRC_DIR/rc_config.c" ]; then
-        if grep -q "RHEL_RELEASE_VERSION(9,6)" "$SRC_DIR/rc_config.c"; then
-            return 0
-        fi
-    fi
-    # Check for EL10 patches
     if [ -f "$SRC_DIR/rc_init.c" ]; then
         if grep -q "sdev_configure" "$SRC_DIR/rc_init.c" 2>/dev/null; then
             return 0
@@ -591,93 +574,10 @@ patch_mk_certs() {
     fi
     
     # Add a marker so we know it's been patched
-    sed -i '1a# PATCHED_FOR_RHEL - AMD rcraid patcher applied RHEL 9.x/10.x fixes' "$mk_certs_file"
+    sed -i '1a# PATCHED_FOR_RHEL - AMD rcraid patcher applied RHEL 10.x fixes' "$mk_certs_file"
     
     print_status "mk_certs patched successfully"
     return 0
-}
-
-apply_patches_el9() {
-    print_status "Applying patches for RHEL 9.x (kernel 5.14.x)..."
-    
-    # Patch rc_config.c - genhd.h fix
-    if grep -q "RHEL_RELEASE_VERSION(9,6)" "$SRC_DIR/rc_config.c"; then
-        print_warning "rc_config.c already patched, skipping..."
-    else
-        print_status "Patching rc_config.c (genhd.h fix)..."
-        
-        cat > /tmp/rc_config_fix.patch << 'PATCH'
---- a/rc_config.c
-+++ b/rc_config.c
-@@ -8,13 +8,12 @@
- #include <linux/fs.h>
- #include <linux/miscdevice.h>
- #include <linux/version.h>
--#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0)
--#ifndef RHEL_RCBUILD
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0) && !defined(RHEL_RELEASE_CODE)
- #include <linux/genhd.h>
--#endif
--#else
--//#include <blkdev.h>
-+#elif defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(9,6)
-+#include <linux/genhd.h>
- #endif
-+#include <linux/blkdev.h>
- #include <linux/sched.h>
- #include <linux/completion.h>
- #include <linux/vmalloc.h>
-PATCH
-        cd "$SRC_DIR"
-        if ! patch -p1 --forward < /tmp/rc_config_fix.patch 2>/dev/null; then
-            print_warning "Patch command failed, trying manual fix..."
-            cp rc_config.c.orig rc_config.c 2>/dev/null || true
-            sed -i '11,17d' rc_config.c
-            sed -i '10a\
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0) \&\& !defined(RHEL_RELEASE_CODE)\
-#include <linux/genhd.h>\
-#elif defined(RHEL_RELEASE_CODE) \&\& RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(9,6)\
-#include <linux/genhd.h>\
-#endif\
-#include <linux/blkdev.h>' rc_config.c
-        fi
-        cd - > /dev/null
-        print_status "rc_config.c patched successfully"
-    fi
-    
-    # Patch rc_init.c - blk_queue functions fix
-    if grep -q "RHEL_RELEASE_VERSION(9,6)" "$SRC_DIR/rc_init.c"; then
-        print_warning "rc_init.c already patched for EL9, skipping..."
-    else
-        print_status "Patching rc_init.c (blk_queue functions fix)..."
-        
-        cd "$SRC_DIR"
-        
-        # Patch blk_queue_max_hw_sectors
-        if grep -q "blk_queue_max_hw_sectors(sdev->request_queue, 256);" rc_init.c; then
-            sed -i '/blk_queue_max_hw_sectors(sdev->request_queue, 256);/c\
-#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)\
-        sdev->host->max_sectors = 256;\
-#else\
-        blk_queue_max_hw_sectors(sdev->request_queue, 256);\
-#endif' rc_init.c
-            echo "  Fixed blk_queue_max_hw_sectors"
-        fi
-
-        # Patch blk_queue_virt_boundary
-        if grep -q "blk_queue_virt_boundary(sdev->request_queue, NVME_CTRL_PAGE_SIZE - 1);" rc_init.c; then
-            sed -i '/blk_queue_virt_boundary(sdev->request_queue, NVME_CTRL_PAGE_SIZE - 1);/c\
-#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)\
-    /* virt_boundary handled differently in RHEL 9.6+ */\
-#else\
-    blk_queue_virt_boundary(sdev->request_queue, NVME_CTRL_PAGE_SIZE - 1);\
-#endif' rc_init.c
-            echo "  Fixed blk_queue_virt_boundary"
-        fi
-        
-        cd - > /dev/null
-        print_status "rc_init.c patched successfully"
-    fi
 }
 
 apply_patches_el10() {
@@ -722,16 +622,7 @@ apply_patches_el10() {
         echo "  Fixed blk_queue_max_hw_sectors -> lim->max_hw_sectors"
     fi
     
-    # Handle the RHEL version conditional we may have added for EL9
-    # Replace the whole conditional block with simple lim assignment
-    if grep -q '#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)' rc_init.c; then
-        # Remove the EL9 conditional and replace with EL10 style
-        sed -i '/#if defined(RHEL_RELEASE_CODE) && RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,6)/,/#endif/c\
-        lim->max_hw_sectors = 256;' rc_init.c
-        echo "  Converted EL9 conditional to EL10 queue_limits style"
-    fi
-    
-    # Remove blk_queue_virt_boundary entirely or convert to lim->virt_boundary_mask
+    # Remove blk_queue_virt_boundary
     if grep -q 'blk_queue_virt_boundary' rc_init.c; then
         sed -i '/blk_queue_virt_boundary/d' rc_init.c
         echo "  Removed blk_queue_virt_boundary (handled differently in 6.12+)"
@@ -745,7 +636,35 @@ apply_patches_el10() {
     else
         echo "  sysctl registration already fixed or not present"
     fi
-    
+
+    # 5. Patch rcblob.x86_64: GetLicenseLevel — mov eax,0x2a030000; ret; nop*4
+    if python3 -c "
+f=open('rcblob.x86_64','rb');f.seek(0x12C0);exit(0 if f.read(6)==bytes([0xb8,0x00,0x00,0x03,0x2a,0xc3]) else 1)
+"; then
+        echo "  rcblob.x86_64 already patched, skipping"
+    else
+        python3 -c "f=open('rcblob.x86_64','r+b');f.seek(0x12C0);f.write(bytes([0xb8,0x00,0x00,0x03,0x2a,0xc3,0x90,0x90,0x90,0x90]));f.close()"
+        echo "  Patched rcblob.x86_64: GetLicenseLevel -> 0x2A030000"
+    fi
+
+    # 6. Add NVMe VID/DID fallback after RC_Unmap_VidDid call
+    if grep -q 'orig_device_id = AMD_NVME_DID' rc_init.c; then
+        echo "  rc_init.c already patched, skipping"
+    else
+        sed -i '/RC_Unmap_VidDid.*orig_vendor_id.*orig_device_id/a\
+\
+    if (hw->orig_vendor_id == 0 \&\& hw->orig_device_id == 0 \&\&\
+        id->vendor == 0x1022 \&\& id->device == AMD_NVME_DID) {\
+        hw->orig_vendor_id = 0x1022;\
+        hw->orig_device_id = AMD_NVME_DID;\
+        rc_printk(RC_WARN, RC_DRIVER_NAME ": %s AMD NVMe detected "\
+                  "at bus %d slot %d, set fallback VID/DID to %04x/%04x\\n",\
+                  __FUNCTION__, hw->pci_bus, hw->pci_slot,\
+                  hw->orig_vendor_id, hw->orig_device_id);\
+    }' rc_init.c
+        echo "  Patched rc_init.c: Added NVMe VID/DID fallback"
+    fi
+
     cd - > /dev/null
     print_status "EL10 patches applied successfully"
 }
@@ -763,15 +682,9 @@ apply_patches() {
     cp -n "$DRIVER_SDK_DIR/mk_certs" "$DRIVER_SDK_DIR/mk_certs.orig" 2>/dev/null || true
     
     # Apply version-specific patches
-    if [ "$RHEL_MAJOR" -ge 10 ]; then
-        # RHEL 10.x / kernel 6.x
-        apply_patches_el10
-    else
-        # RHEL 9.x / kernel 5.14.x
-        apply_patches_el9
-    fi
-    
-    # Patch mk_certs (common to all versions)
+    apply_patches_el10
+
+    # Patch mk_certs
     patch_mk_certs "$DRIVER_SDK_DIR"
     
     # Create symlink for binary blob if needed
@@ -1153,12 +1066,8 @@ setup_dkms() {
     local orig_src_dir="$SRC_DIR"
     SRC_DIR="$DKMS_DIR"
     
-    if [ "$RHEL_MAJOR" -ge 10 ]; then
-        apply_patches_el10
-    else
-        apply_patches_el9
-    fi
-    
+    apply_patches_el10
+
     SRC_DIR="$orig_src_dir"
     
     # Patch mk_certs in DKMS dir
@@ -1376,7 +1285,7 @@ select_kernel_for_build() {
         
         # Custom kernel entry
         if [ "$selection" = "0" ]; then
-            read -p "Enter kernel version (e.g., 5.14.0-503.14.1.el9_5.x86_64): " custom_kernel
+            read -p "Enter kernel version (e.g., 6.12.0-55.11.1.el10_0.x86_64): " custom_kernel
             if [ -z "$custom_kernel" ]; then
                 print_error "No kernel version entered"
                 continue
@@ -1425,25 +1334,9 @@ build_driver_rpm() {
     local BUILD_ROOT="$HOME/rpmbuild"
     local MODULE_PATH=""
     
-    # Detect RHEL version from target kernel
-    local TARGET_RHEL_MAJOR="$RHEL_MAJOR"
-    if [[ "$TARGET_KVERS" == 6.* ]]; then
-        TARGET_RHEL_MAJOR=10
-    elif [[ "$TARGET_KVERS" == 5.* ]]; then
-        TARGET_RHEL_MAJOR=9
-    fi
-    
-    # DYNAMIC: Detect OS info for RPM metadata
-    local OS_SUMMARY=""
-    local OS_DESC=""
-    
-    if [ "$TARGET_RHEL_MAJOR" -ge 10 ]; then
-        OS_SUMMARY="AMD RAID driver for RHEL 10.x"
-        OS_DESC="This package provides the rcraid kernel module built for Linux kernel $TARGET_KVERS (EL10) for the $ARCH family of processors."
-    else
-        OS_SUMMARY="AMD RAID driver for RHEL 9.x"
-        OS_DESC="This package provides the rcraid kernel module built for Linux kernel $TARGET_KVERS (EL9) for the $ARCH family of processors."
-    fi
+    # RPM metadata
+    local OS_SUMMARY="AMD RAID driver for RHEL 10.x"
+    local OS_DESC="This package provides the rcraid kernel module built for Linux kernel $TARGET_KVERS (EL10) for the $ARCH family of processors."
     
     print_status "Building for: $OS_NAME"
     print_status "Target kernel: $TARGET_KVERS"
@@ -1543,12 +1436,8 @@ build_driver_rpm() {
     print_status "Installing build dependencies..."
     dnf install -y rpm-build rpmdevtools createrepo_c 2>/dev/null || true
     
-    # Install ISO tools based on RHEL version
-    if [ "$RHEL_MAJOR" -ge 10 ]; then
-        dnf install -y xorriso 2>/dev/null || true
-    else
-        dnf install -y genisoimage 2>/dev/null || true
-    fi
+    # Install ISO tools
+    dnf install -y xorriso 2>/dev/null || true
     
     # Setup RPM build environment
     rm -f $BUILD_ROOT/RPMS/x86_64/kmod-rcraid*.rpm 2>/dev/null || true
@@ -1724,11 +1613,7 @@ build_driver_iso() {
     
     # Install ISO creation tools based on RHEL version
     print_status "Installing ISO creation tools..."
-    if [ "$RHEL_MAJOR" -ge 10 ]; then
-        dnf install -y createrepo_c xorriso 2>/dev/null || true
-    else
-        dnf install -y createrepo_c genisoimage 2>/dev/null || true
-    fi
+    dnf install -y createrepo_c xorriso 2>/dev/null || true
     
     print_status "Creating Driver Update Disk ISO..."
     
@@ -1919,19 +1804,9 @@ POSTINSTALL
             -rockridge on \
             -map "$DUD_DIR" / \
             -commit
-    elif command -v genisoimage >/dev/null 2>&1; then
-        print_status "Using genisoimage..."
-        genisoimage -o "$ISO_PATH" -R -J -V "$VOLUME_LABEL" "$DUD_DIR"
-    elif command -v mkisofs >/dev/null 2>&1; then
-        print_status "Using mkisofs..."
-        mkisofs -o "$ISO_PATH" -R -J -V "$VOLUME_LABEL" "$DUD_DIR"
     else
         print_error "No ISO creation tool found!"
-        if [ "$RHEL_MAJOR" -ge 10 ]; then
-            echo "Please install xorriso: sudo dnf install xorriso"
-        else
-            echo "Please install genisoimage: sudo dnf install genisoimage"
-        fi
+        echo "Please install xorriso: sudo dnf install xorriso"
         rm -rf $DUD_DIR
         return 1
     fi
@@ -2212,8 +2087,6 @@ show_system_status() {
     # ISO tools status
     if command -v xorriso &> /dev/null; then
         echo -e "ISO Tool:       ${GREEN}xorriso${NC}"
-    elif command -v genisoimage &> /dev/null; then
-        echo -e "ISO Tool:       ${GREEN}genisoimage${NC}"
     else
         echo -e "ISO Tool:       ${YELLOW}NOT INSTALLED${NC}"
     fi
