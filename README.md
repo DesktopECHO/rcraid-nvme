@@ -6,7 +6,7 @@ AMD RAIDXpert2 `rcraid` driver for modern Linux kernels (6.12 to 7.0+) on AMD Ry
 
 ## The problem
 
-The `rcraid` driver from AMD will not build on kernel ~6.12 and newer.  A recent version (9.3.3.302, February 2026) of `rcraid` distributed by [Lenovo](https://support.lenovo.com/bb/en/downloads/DS579640) includes `raidxpert2-9.3.3_00302-1.x86_64.rpm` and also has this issue.  The second problem is that on AMD APU's (ex: Phoenix, Strix Halo) `rcraid` won't recognize NVMe drives, seemingly due to variables expected in EFI that don't exist on these platforms. A recent kernel (~6.19) is needed to take advantage of the APU for AI/LLM workloads so this bad news if you want the highest possible disk I/O with the ability to dual-boot operating systems and read/write eachother's filesystem.
+The `rcraid` driver from AMD will not build on kernel ~6.12 and newer.  A recent version (9.3.3.302, February 2026) of `rcraid` distributed by [Lenovo](https://support.lenovo.com/bb/en/downloads/DS579640) includes `raidxpert2-9.3.3_00302-1.x86_64.rpm` and also has this issue.  The second problem is that on AMD APU's (ex: Phoenix, Strix Halo) `rcraid` won't recognize NVMe drives, seemingly due to variables expected in EFI that don't exist on these platforms. A recent kernel (~6.19) is needed to take advantage of the APU for AI/LLM workloads so this is bad news if you want the highest possible disk I/O with the ability to dual-boot operating systems and read/write each other's filesystems.
 
 ## The solution
 
