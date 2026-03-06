@@ -69,11 +69,10 @@ fi
 # 2.  Extract upstream RPM
 # ════════════════════════════════════════════════════════════════════
 echo "Extracting upstream RPM..."
-mkdir -p "$WORK/original"
-( cd "$WORK/original" && rpm2cpio "$UPSTREAM_RPM" | cpio -idm --quiet )
-
 ROOT="$WORK/root"
-cp -a "$WORK/original" "$ROOT"
+mkdir -p "$ROOT"
+( cd "$ROOT" && rpm2cpio "$UPSTREAM_RPM" | cpio -idm --quiet )
+rm -rf "$ROOT/usr/lib/.build-id"
 
 SRC="$ROOT/usr/src/$DKMS_NAME-$DKMS_VER/src"
 SDK="$ROOT/usr/src/$DKMS_NAME-$DKMS_VER"
@@ -81,31 +80,44 @@ SDK="$ROOT/usr/src/$DKMS_NAME-$DKMS_VER"
 # ════════════════════════════════════════════════════════════════════
 # 3.  Patch binary blob
 # ════════════════════════════════════════════════════════════════════
-echo "Selecting v2 blob..."
+echo "Selecting and patching v2 blob..."
 rm -f "$SRC/rcblob.x86_64"
 ln -sf rcblob_v2.x86_64 "$SRC/rcblob.x86_64.o"
 
-# Patch so NVMe RAID works on Ryzen APUs.
+# Two binary patches unlock full RAID functionality on Ryzen APUs.
 #
-#   v2 .text section starts at file offset 0x90.
-#   Symbol is at .text+0xc50 → file offset 0xce0.
+# v2 .text section starts at file offset 0x90.
+#
+# Patch 1 — CPUID identity (0xce4):
+#   RC_HW_OS_GetLic… at .text+0xc50 → file offset 0xce0.
 #   First 4 bytes are endbr64 (f3 0f 1e fa) which we preserve.
-#   Patch at 0xce4: mov eax, 0x2a030000 ; ret ; nop×4
-#
+#   Overwrite at 0xce4: mov eax, 0x2a030000 ; ret ; nop×4
 #   Return value 0x2a030000:
-#     - Top byte 0x2a passes the check in DiscoverAdapter.
-#     - Sub-type 0x03 maps to feature mask 0x01ff (RAID 0/1/10 access).
-#      
+#     - Top byte 0x2a passes the magic check in DiscoverAdapter.
+#     - Sub-type 0x03 selects the correct product name ("RC-S…") and
+#       hardware flags via the hardcoded fast-path in GetProductNameAndFeatures.
+#
+# Patch 2 — Feature gate unlock (0x6017c):
+#   RC_ScanBus initialises RC_CoreFeatureSet to 0xffff, then AND-reduces
+#   it with each controller's per-controller mask.  The AND instruction
+#   at .text+0x600ec → file offset 0x6017c narrows the global mask to
+#   whatever the per-controller license allows (e.g. 0x01ff for sub-type
+#   0x03 — RAID 0/1/10 only).  Changing the opcode from AND (0x21) to
+#   CMP (0x39) preserves the instruction format and its R_X86_64_PC32
+#   relocation (so the module loader stays happy) but turns the memory
+#   write into a read-only comparison that harmlessly sets flags.
+#   RC_CoreFeatureSet stays at 0xffff: All RAID levels are available.
+#
 echo "Patching v2 blob..."
 python3 -c "
 with open('$SRC/rcblob_v2.x86_64', 'r+b') as f:
+    # ── Patch 1: CPUID identity (sub-type 0x03) ──
     f.seek(0xce4)
     f.write(bytes([
         0xb8, 0x00, 0x00, 0x03, 0x2a,   # mov eax, 0x2a030000
         0xc3,                             # ret
         0x90, 0x90, 0x90, 0x90            # nop padding
     ]))
-    # Read back and verify
     f.seek(0xce0)
     got = f.read(10)
     expect = bytes([
@@ -113,14 +125,34 @@ with open('$SRC/rcblob_v2.x86_64', 'r+b') as f:
         0xb8, 0x00, 0x00, 0x03, 0x2a,    # mov eax, 0x2a030000
         0xc3                              # ret
     ])
-    assert got == expect, f'Patch verification failed: {got.hex()}'
-print('  Blob patch verified OK')
+    assert got == expect, f'Patch 1 verify failed: {got.hex()}'
+    print('  Patch 1 (CPUID identity) verified OK')
+
+    # ── Patch 2: AND → CMP on RC_CoreFeatureSet ──
+    # Change opcode byte only: 0x21 (AND r/m32,r32) → 0x39 (CMP r/m32,r32).
+    # The ModRM, displacement, and relocation entry are all unchanged.
+    f.seek(0x6017c)
+    old = f.read(1)
+    assert old == bytes([0x21]), \
+        f'Patch 2 pre-check failed (expected AND opcode 0x21): {old.hex()}'
+    f.seek(0x6017c)
+    f.write(bytes([0x39]))   # CMP r/m32, r32
+    f.seek(0x6017c)
+    got = f.read(1)
+    assert got == bytes([0x39]), \
+        f'Patch 2 verify failed: {got.hex()}'
+    print('  Patch 2 (feature gate unlock) verified OK')
+print('  Both blob patches applied and verified')
 "
 
 # ════════════════════════════════════════════════════════════════════
 # 4.  Patch C source and Makefile
 # ════════════════════════════════════════════════════════════════════
 echo "Patching source files..."
+
+# Cleanup logging
+sed -i 's/matched supported adapter - vendor = 0x%x device 0x%x/matched supported adapter, Vendor:%04x, Device:%04x/' \
+    "$SRC/rc_init.c"
 
 # register_sysctl → register_sysctl_sz (removed in 6.11+)
 sed -i 's/register_sysctl("rcraid", rcraid_table)/register_sysctl_sz("rcraid", rcraid_table, ARRAY_SIZE(rcraid_table) - 1)/' \
@@ -135,7 +167,7 @@ sed -i '/RC_Unmap_VidDid.*orig_vendor_id.*orig_device_id/a\
         hw->orig_vendor_id = 0x1022;\
         hw->orig_device_id = AMD_NVME_DID;\
         rc_printk(RC_WARN, RC_DRIVER_NAME ": %s AMD NVMe "\
-                  "on bus %d slot %d, VID/DID %04x/%04x\\n",\
+                  "on bus %d slot %d, Vendor:%04x Device:%04x\\n",\
                   __FUNCTION__, hw->pci_bus, hw->pci_slot,\
                   hw->orig_vendor_id, hw->orig_device_id);\
     }' "$SRC/rc_init.c"
@@ -148,8 +180,6 @@ sed -i 's/-outform DEV/-outform DER/g' "$SDK/mk_certs"
 sed -i 's|if \[ -f "/usr/src/linux-headers-\$KVERS/scripts/sign-file" \]; then|if [ -f "/usr/src/linux-headers-$KVERS/scripts/sign-file" ]; then\n\t\tSIGN_TOOL=/usr/src/linux-headers/$KVERS/scripts/sign-file\n\t    elif [ -f "/usr/src/kernels/$KVERS/scripts/sign-file" ]; then|g' "$SDK/mk_certs"
 
 # Makefile: replace blob-selection case with v2 symlink, remove redhat-release guards
-
-echo "Patching Makefile..."
 python3 - "$SRC/Makefile" << 'PYEOF'
 import re, sys
 
@@ -170,14 +200,12 @@ mk = re.sub(
 with open(sys.argv[1], 'w') as f:
     f.write(mk)
 PYEOF
-echo "  Makefile patched OK"
 
 # ════════════════════════════════════════════════════════════════════
 # 5.  Write DKMS metadata
 # ════════════════════════════════════════════════════════════════════
 echo "Writing DKMS files..."
 
-# --- dkms.conf ---
 # MAKE wraps the real make in a subshell with a trap so that the
 # pahole symlink (set up by pre_build.sh) is always restored, even
 # when the build fails.
@@ -193,7 +221,6 @@ PRE_BUILD="pre_build.sh $kernelver"
 MAKE[0]="bash -c 'restore_pahole() { if [ -f /usr/bin/pahole.real ]; then mv /usr/bin/pahole.real /usr/bin/pahole; elif [ -L /usr/bin/pahole ]; then rm -f /usr/bin/pahole; fi; }; trap restore_pahole EXIT; make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build/src modules'"
 DKMSEOF
 
-# --- pre_build.sh ---
 cat > "$SDK/pre_build.sh" << 'PREBUILD'
 #!/bin/bash
 set -euo pipefail
@@ -201,24 +228,21 @@ KVER="${1:?pre_build.sh requires a kernel version argument}"
 DIR="$(dirname "$0")/src"
 cd "$DIR"
 
-# Parse major.minor
 KMAJ="${KVER%%.*}"
 KMIN="${KVER#*.}"; KMIN="${KMIN%%.*}"
+kver_ge() { [ "$KMAJ" -gt "$1" ] || { [ "$KMAJ" -eq "$1" ] && [ "$KMIN" -ge "$2" ]; }; }
 echo "pre_build.sh: kernel $KVER (major=$KMAJ minor=$KMIN)"
 
-# --- Clean previous build ---
+# Clean previous build
 for d in "/usr/src/linux-headers-$KVER" "/usr/src/kernels/$KVER" "/lib/modules/$KVER/build"; do
     [ -d "$d" ] && { make -C "$d" M="$DIR" clean 2>/dev/null || true; break; }
 done
 
-# --- Symlink blob ---
 ln -sf rcblob_v2.x86_64 rcblob.x86_64.o
 
-# --- pahole workaround (kernel ≤ 6.12) ---
-# On older kernels the BTF pass invokes pahole and fails on this module.
-# We swap pahole with /bin/true before the build.  The MAKE[0] trap in
-# dkms.conf restores it afterward regardless of build success/failure.
-if [ "$KMAJ" -lt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -le 12 ]; }; then
+# pahole workaround (kernel ≤ 6.12) — swap with /bin/true before build;
+# the MAKE[0] trap in dkms.conf restores it afterward.
+if ! kver_ge 6 13; then
     PAHOLE="$(command -v pahole 2>/dev/null || true)"
     if [ -n "$PAHOLE" ] && [ ! -L "$PAHOLE" ]; then
         echo "  pahole workaround: $PAHOLE → /bin/true (kernel ≤ 6.12)"
@@ -227,26 +251,20 @@ if [ "$KMAJ" -lt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -le 12 ]; }; then
     fi
 fi
 
-# --- Timer API (kernel ≥ 6.13) ---
-if [ "$KMAJ" -gt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -ge 13 ]; }; then
-    grep -ql '\bfrom_timer\b' rc_init.c rc_msg.c 2>/dev/null &&
-        sed -i 's/\bfrom_timer\b/timer_container_of/g' rc_init.c rc_msg.c
-    grep -ql '\bdel_timer_sync\b' rc_msg.c 2>/dev/null &&
-        sed -i 's/\bdel_timer_sync\b/timer_delete_sync/g' rc_msg.c
+# Timer API (kernel ≥ 6.13)
+if kver_ge 6 13; then
+    sed -i 's/\bfrom_timer\b/timer_container_of/g' rc_init.c rc_msg.c
+    sed -i 's/\bdel_timer_sync\b/timer_delete_sync/g' rc_msg.c
 else
-    grep -ql '\btimer_container_of\b' rc_init.c rc_msg.c 2>/dev/null &&
-        sed -i 's/\btimer_container_of\b/from_timer/g' rc_init.c rc_msg.c
-    grep -ql '\btimer_delete_sync\b' rc_msg.c 2>/dev/null &&
-        sed -i 's/\btimer_delete_sync\b/del_timer_sync/g' rc_msg.c
+    sed -i 's/\btimer_container_of\b/from_timer/g' rc_init.c rc_msg.c
+    sed -i 's/\btimer_delete_sync\b/del_timer_sync/g' rc_msg.c
 fi
 
-# --- bios_param signature (kernel ≥ 6.18) ---
-if [ "$KMAJ" -gt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -ge 18 ]; }; then
-    grep -q 'struct block_device \*bdev' rc_init.c &&
-        sed -i 's/struct block_device \*bdev/struct gendisk *disk/g' rc_init.c
+# bios_param signature (kernel ≥ 6.18)
+if kver_ge 6 18; then
+    sed -i 's/struct block_device \*bdev/struct gendisk *disk/g' rc_init.c
 else
-    grep -q 'struct gendisk \*disk' rc_init.c &&
-        sed -i 's/struct gendisk \*disk/struct block_device *bdev/g' rc_init.c
+    sed -i 's/struct gendisk \*disk/struct block_device *bdev/g' rc_init.c
 fi
 
 echo "pre_build.sh: done"
@@ -256,8 +274,6 @@ chmod +x "$SDK/pre_build.sh"
 # ════════════════════════════════════════════════════════════════════
 # 6.  Write shared DKMS lifecycle script
 # ════════════════════════════════════════════════════════════════════
-# Both RPM %post/%preun and DEB postinst/prerm delegate to this script
-# so the logic lives in exactly one place.
 cat > "$SDK/rcraid-dkms.sh" << 'LIFECYCLE'
 #!/bin/bash
 # rcraid-dkms.sh — shared DKMS lifecycle handler
@@ -393,12 +409,7 @@ EOF
 fi
 
 # ════════════════════════════════════════════════════════════════════
-# 8.  Clean extracted cruft
-# ════════════════════════════════════════════════════════════════════
-rm -rf "$ROOT/usr/lib/.build-id"
-
-# ════════════════════════════════════════════════════════════════════
-# 9.  Build the package
+# 8.  Build the package
 # ════════════════════════════════════════════════════════════════════
 echo ""
 echo "Building $DISTRO package..."
@@ -430,7 +441,6 @@ kernel.  Includes dracut config so the driver is available during
 early boot for AMD RAID arrays.
 
 %prep
-%build
 %install
 mkdir -p %{buildroot}
 cp -a %{_sourcedir}/* %{buildroot}/
@@ -457,7 +467,9 @@ fi
 %changelog
 * Fri Mar 06 2026 Zero <zero@441.surf>
 - Unified build script (RPM + DEB)
-- v2 blob with patch (0xce4, sub-type 0x03)
+- v2 blob with two patches:
+  - 0xce4: CPUID identity (sub-type 0x03, correct product name/flags)
+  - 0x6017c: AND→CMP (RC_CoreFeatureSet stays 0xffff, all RAID levels)
 - Shared DKMS lifecycle script (rcraid-dkms.sh)
 - pahole workaround with trap-based cleanup
 SPECEOF
@@ -497,7 +509,6 @@ Description: AMD RAIDXpert2 driver patched for modern kernels (DKMS)
  during early boot for AMD RAID arrays.
 EOF
 
-    # All four maintainer scripts just delegate to the shared lifecycle script.
     cat > "$PKG/DEBIAN/postinst" << 'EOF'
 #!/bin/bash
 set -e

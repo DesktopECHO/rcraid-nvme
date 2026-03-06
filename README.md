@@ -6,17 +6,18 @@ AMD RAIDXpert2 `rcraid` driver for modern Linux kernels (6.12 to 7.0+) on AMD Ry
 
 ## The problem
 
-The `rcraid` driver from AMD will not build on kernel ~6.12 and newer.  A recent version (9.3.3.302, February 2026) of `rcraid` distributed by [Lenovo](https://support.lenovo.com/bb/en/downloads/DS579640) includes `raidxpert2-9.3.3_00302-1.x86_64.rpm` and also has this issue.  The second problem is that on AMD APU's (ex: Phoenix, Strix Halo) `rcraid` won't recognize NVMe drives, seemingly due to variables expected in EFI that don't exist on these platforms. A recent kernel (~6.19) is needed to take advantage of the APU for AI/LLM workloads so this bad news if you want the highest possible disk I/O with the ability to dual-boot operating systems and read/write eachother's filesystem.
+The `rcraid` driver from AMD will not build on kernel ~6.12 and newer.  A recent version (9.3.3.302, February 2026) of `rcraid` distributed by [Lenovo](https://support.lenovo.com/bb/en/downloads/DS579640) includes `raidxpert2-9.3.3_00302-1.x86_64.rpm` and also has this issue.  The second problem is that on AMD APU's (ex: Phoenix, Strix Halo) `rcraid` won't recognize NVMe drives, seemingly due to variables expected in EFI that don't exist on these platforms. A recent kernel (~6.19) is needed to take advantage of the APU for AI/LLM workloads so this is bad news if you want the highest possible disk I/O with the ability to dual-boot operating systems and read/write each other's filesystems.
 
 ## The solution
 
-This project extracts the Lenovo RPM, applies a set of patches to work with modern kernels, patches the `rcblob` binary to work with APUs, and repackages with DKMS automation to ensure the module is rebuilt in lockstep with kernel upgrades.  It enables a clean, bootable Linux installation on RAID 0 (Stripe) or RAID 1 (Mirror) volumes created by RAIDXpert2.  For APU owners, this brings the Linux version to feature parity with RAIDXpert2 on Windows.
+This project extracts the Lenovo-supplied RPM, applies a set of patches to work with modern kernels, patches the `rcblob` binary to work with AMD APUs (+some CPUs), and repackages with DKMS automation to ensure the module is rebuilt in lockstep with kernel upgrades.  It enables a clean, bootable Linux install on RAID volumes created by RAIDXpert2.  This brings the Linux version to feature parity with RAIDXpert2 on Windows.
 
 ## Patches applied
 
 | Patch | Purpose |
 |-------|---------|
-| **APU Enabler** | Patches the v2 blob at file offset `0xce4` (after `endbr64`) to return `0x2a030000`, which maps to feature mask `0x01ff` — enables NVMe RAID 0/1/10 on Ryzen APUs |
+| **APU Enabler** | Patches the v2 blob at file offset `0xce4` (after `endbr64`) to return `0x2a030000` — forces sub-type `0x03` so the driver identifies correctly on Ryzen APUs (proper product name, hardware flags, and logging) |
+| **Feature Unlock** | Patches the v2 blob at file offset `0x6017c` — changes a single opcode byte from `AND` (`0x21`) to `CMP` (`0x39`), preventing `RC_CoreFeatureSet` from being narrowed below `0xffff`. |
 | **NVMe VID/DID** | Fixes AMD NVMe vendor/device detection on APU platforms where EFI variables are absent |
 | **`register_sysctl_sz`** | Replaces removed `register_sysctl()` API (6.11+) |
 | **`ccflags-y`** | Replaces deprecated `EXTRA_CFLAGS` in the Makefile |
@@ -35,7 +36,7 @@ This guide covers installing Fedora or Debian Linux on RAID arrays using their r
 
 ### Prerequisites
 
-- **RAID Configuration**: Create your RAID 0/1 volume using the RAID configuration utility in BIOS, through RAIDXpert2 on Windows or the RAIDXpert2 Linux binary included with this package.
+- **RAID Configuration**: Create your RAID volume using the RAID configuration utility in BIOS, through RAIDXpert2 on Windows or the RAIDXpert2 Linux binary included with this package.
 - **Live CD**: Fedora Workstation Live ISO or Debian Desktop Live ISO
 - **Bootable Media**: USB drive created with the Live ISO
 
@@ -121,6 +122,10 @@ Both packages run a removal script that calls `dkms remove`, unloads the module,
 
 ## Development
 
-- **`raidxpert2-install`** — Unified build script that detects RPM/DEB distributions and builds the appropriate package. Extracts the upstream RPM, applies all patches (including v2 blob patch at `0xce4`), writes DKMS metadata, distro-specific initramfs assets, and the shared lifecycle script. Generates the package, installs it, then enters the live-CD flow: polls for the installer's target mount (Anaconda `/mnt/sysroot/` for RPM, Calamares `/tmp/calamares-root-*/` for DEB), copies the package, and chroots in to install it on the new system.
+- **`raidxpert2-install`** — Unified build script that detects RPM/DEB distributions and builds the appropriate package. Extracts the upstream RPM, applies all patches (two blob patches at `0xce4` and `0x6017c`, plus C source fixes), writes DKMS metadata, distro-specific initramfs assets, and the shared lifecycle script. Generates the package, installs it, then enters the live-CD flow: polls for the installer's target mount (Anaconda `/mnt/sysroot/` for RPM, Calamares `/tmp/calamares-root-*/` for DEB), copies the package, and chroots in to install it on the new system.
 - **`pre_build.sh`** — DKMS `PRE_BUILD` hook; runs before every `dkms build`. Applies kernel-version-gated source patches (timer API ≥ 6.13, bios_param ≥ 6.18) and the pahole workaround (≤ 6.12). Symlinks the v2 blob as `rcblob.x86_64.o`.
 - **`rcraid-dkms.sh`** — Shared DKMS lifecycle handler called by both RPM `%post`/`%preun` and DEB `postinst`/`prerm`. Handles `dkms add/build/install`, module loading, and initramfs regeneration (auto-detects dracut vs update-initramfs). Eliminates duplicated post-install logic between the two package formats.
+
+## Words of Warning
+
+While the original RPM package contains ony AMD-authored code, it has been patched from its original form and therefore not supported by AMD. **Use at your own risk.** Always back up important data before installing kernel drivers from unofficial sources.
