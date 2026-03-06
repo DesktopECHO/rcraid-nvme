@@ -124,3 +124,7 @@ Both packages run a removal script that calls `dkms remove`, unloads the module,
 - **`raidxpert2-install`** — Unified build script that detects RPM/DEB distributions and builds the appropriate package. Extracts the upstream RPM, applies all patches (including v2 blob patch at `0xce4`), writes DKMS metadata, distro-specific initramfs assets, and the shared lifecycle script. Generates the package, installs it, then enters the live-CD flow: polls for the installer's target mount (Anaconda `/mnt/sysroot/` for RPM, Calamares `/tmp/calamares-root-*/` for DEB), copies the package, and chroots in to install it on the new system.
 - **`pre_build.sh`** — DKMS `PRE_BUILD` hook; runs before every `dkms build`. Applies kernel-version-gated source patches (timer API ≥ 6.13, bios_param ≥ 6.18) and the pahole workaround (≤ 6.12). Symlinks the v2 blob as `rcblob.x86_64.o`.
 - **`rcraid-dkms.sh`** — Shared DKMS lifecycle handler called by both RPM `%post`/`%preun` and DEB `postinst`/`prerm`. Handles `dkms add/build/install`, module loading, and initramfs regeneration (auto-detects dracut vs update-initramfs). Eliminates duplicated post-install logic between the two package formats.
+
+## Words of Warning
+
+While this package contains only AMD-authored code, it has been patched from its original form and is not supported by AMD. **Use at your own risk.** Always back up important data before installing kernel drivers from unofficial sources.
