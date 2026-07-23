@@ -2,7 +2,7 @@
 #
 # raidxpert2-install — Build and install a patched AMD RAIDXpert2 DKMS package.
 # Detects RPM (Fedora/RHEL) or DEB (Debian/Ubuntu) and produces the right package.
-# Usage: ./raidxpert2-install
+# Usage: ./raidxpert2-install [--blob=v1|v2]
 #
 set -euo pipefail
 
@@ -13,6 +13,25 @@ PKG_NAME="rcraid-nvme"
 PKG_VERSION="1"
 PKG_RELEASE="1"
 UPSTREAM_RPM_NAME="raidxpert2-9.3.3_00302-1.x86_64.rpm"
+
+# ── Blob version selection ──────────────────────────────────────
+# Both blobs get the same APU patches (see step 3); this only picks which
+# one is actually linked into the built module. Default v2 (modern
+# toolchain, full Spectre/CET hardening). Override with --blob=v1 or
+# RCBLOB_VERSION=v1.
+BLOB_VERSION="${RCBLOB_VERSION:-v2}"
+for arg in "$@"; do
+    case "$arg" in
+        --blob=v1|--blob=v2) BLOB_VERSION="${arg#--blob=}" ;;
+        --blob=*) echo "ERROR: --blob must be v1 or v2" >&2; exit 1 ;;
+    esac
+done
+case "$BLOB_VERSION" in
+    v1) BLOB_FILE="rcblob.x86_64" ;;
+    v2) BLOB_FILE="rcblob_v2.x86_64" ;;
+    *)  echo "ERROR: blob version must be v1 or v2 (got: $BLOB_VERSION)" >&2; exit 1 ;;
+esac
+echo "Blob selection: $BLOB_VERSION ($BLOB_FILE)"
 
 # ── Detect distribution ──────────────────────────────────────────
 if command -v apt-get >/dev/null 2>&1; then
@@ -78,40 +97,47 @@ SRC="$ROOT/usr/src/$DKMS_NAME-$DKMS_VER/src"
 SDK="$ROOT/usr/src/$DKMS_NAME-$DKMS_VER"
 
 # ════════════════════════════════════════════════════════════════════
-# 3.  Patch binary blob
+# 3.  Patch binary blobs
 # ════════════════════════════════════════════════════════════════════
-echo "Selecting and patching v2 blob..."
-rm -f "$SRC/rcblob.x86_64"
-ln -sf rcblob_v2.x86_64 "$SRC/rcblob.x86_64.o"
-
-# Two binary patches unlock full RAID functionality on Ryzen APUs.
+# Both rcblob.x86_64 (v1, GCC 4.1.1, no hardening) and rcblob_v2.x86_64
+# (v2, GCC 13.3, retpolines/CET/SLS) get patches 1 and 2 to unlock full
+# RAID functionality on Ryzen APUs. v2 also gets patch 3 (stack canary
+# neutralization): v2 was compiled with -fstack-protector-strong, which
+# emits gs:[0x28] accesses that fault on kernels lacking
+# CONFIG_STACKPROTECTOR_STRONG (e.g. custom builds on Linux >= 6.15 where
+# fixed_percpu_data was removed). Patching unconditionally is safe because
+# kernel modules have no meaningful stack-canary security boundary anyway.
+# v1 (GCC 4.1.1) was built without stack protection and needs no patch.
+# $BLOB_FILE (selected above) is the one actually linked into the module;
+# the other is patched too but left unused on disk so --blob can be
+# flipped later without re-running this whole extraction.
 #
-# v2 .text section starts at file offset 0x90.
+# Patch 1 — CPUID identity:
+#   RC_HW_OS_GetLicenseLevel returns a CPUID-derived value that
+#   DiscoverAdapter checks (top byte 0x2a) and GetProductNameAndFeatures
+#   uses to pick product name + hardware flags via a hardcoded fast-path
+#   for sub-type 0x03 ("RC-S…", mask 0x01ff — RAID 0/1/10). Patched to
+#   unconditionally: mov eax, 0x2a030000 ; ret
+#     v2 — file offset 0xce4 (.text+0xc50, right after the endbr64
+#          prologue at 0xce0, which is preserved — v2 has CET landing pads)
+#     v1 — file offset 0x1310 (.text+0x12d0 — no endbr64 to preserve;
+#          GCC 4.1.1 predates CET, so the patch starts at the function entry)
 #
-# Patch 1 — CPUID identity (0xce4):
-#   RC_HW_OS_GetLic… at .text+0xc50 → file offset 0xce0.
-#   First 4 bytes are endbr64 (f3 0f 1e fa) which we preserve.
-#   Overwrite at 0xce4: mov eax, 0x2a030000 ; ret ; nop×4
-#   Return value 0x2a030000:
-#     - Top byte 0x2a passes the magic check in DiscoverAdapter.
-#     - Sub-type 0x03 selects the correct product name ("RC-S…") and
-#       hardware flags via the hardcoded fast-path in GetProductNameAndFeatures.
-#
-# Patch 2 — Feature gate unlock (0x6017c):
+# Patch 2 — Feature gate unlock:
 #   RC_ScanBus initialises RC_CoreFeatureSet to 0xffff, then AND-reduces
-#   it with each controller's per-controller mask.  The AND instruction
-#   at .text+0x600ec → file offset 0x6017c narrows the global mask to
-#   whatever the per-controller license allows (e.g. 0x01ff for sub-type
-#   0x03 — RAID 0/1/10 only).  Changing the opcode from AND (0x21) to
-#   CMP (0x39) preserves the instruction format and its R_X86_64_PC32
-#   relocation (so the module loader stays happy) but turns the memory
-#   write into a read-only comparison that harmlessly sets flags.
-#   RC_CoreFeatureSet stays at 0xffff: All RAID levels are available.
+#   it with each controller's per-controller mask. Changing that AND
+#   (0x21) to CMP (0x39) preserves the instruction format and its
+#   R_X86_64_PC32 relocation (so the module loader stays happy) but turns
+#   the memory write into a read-only comparison that harmlessly sets
+#   flags. RC_CoreFeatureSet stays at 0xffff: all RAID levels are available.
+#     v2 — file offset 0x6017c (.text+0x600ec, inside RC_ScanBus)
+#     v1 — file offset 0x5e959 (.text+0x5e919, inside the same function —
+#          identical instruction encoding, different offset only because
+#          v1 was built by a different compiler)
 #
-echo "Patching v2 blob..."
+echo "Patching v1 and v2 blobs..."
 python3 -c "
-with open('$SRC/rcblob_v2.x86_64', 'r+b') as f:
-    # ── Patch 1: CPUID identity (sub-type 0x03) ──
+def patch1_v2(f):
     f.seek(0xce4)
     f.write(bytes([
         0xb8, 0x00, 0x00, 0x03, 0x2a,   # mov eax, 0x2a030000
@@ -125,25 +151,94 @@ with open('$SRC/rcblob_v2.x86_64', 'r+b') as f:
         0xb8, 0x00, 0x00, 0x03, 0x2a,    # mov eax, 0x2a030000
         0xc3                              # ret
     ])
-    assert got == expect, f'Patch 1 verify failed: {got.hex()}'
-    print('  Patch 1 (CPUID identity) verified OK')
+    assert got == expect, f'v2 patch 1 verify failed: {got.hex()}'
 
-    # ── Patch 2: AND → CMP on RC_CoreFeatureSet ──
+def patch3_stack_canary(f):
+    # v2 compiled with -fstack-protector-strong. GCC inserts:
+    #   Prologue: 65 4W 8b MM 25 28 00 00 00  (MOV reg, gs:[0x28])
+    #   Epilogue: 65 4W 2b MM 25 28 00 00 00  (SUB reg, gs:[0x28])
+    # Each 9-byte sequence is replaced in-place with XOR reg,reg + NOPs:
+    #   Prologue -> XOR r32,r32  (32-bit zero-extends; saved canary = 0)
+    #   Epilogue -> XOR r64,r64  (diff = 0; stack check always passes)
+    f.seek(0)
+    data = bytearray(f.read())
+    count = 0
+    i = 0
+    while i < len(data) - 8:
+        if (data[i]   == 0x65 and
+            data[i+1] in (0x48, 0x4c) and
+            data[i+2] in (0x8b, 0x2b) and
+            data[i+4] == 0x25 and
+            data[i+5] == 0x28 and
+            data[i+6] == 0x00 and
+            data[i+7] == 0x00 and
+            data[i+8] == 0x00):
+            rex_r = (data[i+1] >> 2) & 1
+            reg   = (data[i+3] >> 3) & 7
+            xm    = 0xC0 | (reg << 3) | reg
+            if data[i+2] == 0x8b:
+                if rex_r:
+                    data[i:i+9] = bytes([0x45, 0x31, xm, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90])
+                else:
+                    data[i:i+9] = bytes([0x31, xm, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90])
+            else:
+                if rex_r:
+                    data[i:i+9] = bytes([0x4D, 0x31, xm, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90])
+                else:
+                    data[i:i+9] = bytes([0x48, 0x31, xm, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90])
+            count += 1
+            i += 9
+        else:
+            i += 1
+    assert count > 0, f'patch3: no gs:[0x28] refs found (wrong blob?)'
+    f.seek(0)
+    f.write(bytes(data))
+    return count
+
+def patch1_v1(f):
+    # No endbr64 prologue in v1 — overwrite starts at the function entry.
+    f.seek(0x1310)
+    got = f.read(9)
+    expect = bytes([0x55, 0xbf, 0x01, 0x00, 0x00, 0x80, 0x48, 0x89, 0xe5])
+    assert got == expect, f'v1 patch 1 pre-check failed: {got.hex()}'
+    f.seek(0x1310)
+    f.write(bytes([
+        0xb8, 0x00, 0x00, 0x03, 0x2a,   # mov eax, 0x2a030000
+        0xc3,                             # ret
+        0x90, 0x90, 0x90, 0x90            # nop padding
+    ]))
+    f.seek(0x1310)
+    got = f.read(10)
+    expect = bytes([0xb8, 0x00, 0x00, 0x03, 0x2a, 0xc3, 0x90, 0x90, 0x90, 0x90])
+    assert got == expect, f'v1 patch 1 verify failed: {got.hex()}'
+
+def patch2(f, offset, label):
     # Change opcode byte only: 0x21 (AND r/m32,r32) → 0x39 (CMP r/m32,r32).
     # The ModRM, displacement, and relocation entry are all unchanged.
-    f.seek(0x6017c)
+    f.seek(offset)
     old = f.read(1)
     assert old == bytes([0x21]), \
-        f'Patch 2 pre-check failed (expected AND opcode 0x21): {old.hex()}'
-    f.seek(0x6017c)
+        f'{label} patch 2 pre-check failed (expected AND opcode 0x21): {old.hex()}'
+    f.seek(offset)
     f.write(bytes([0x39]))   # CMP r/m32, r32
-    f.seek(0x6017c)
+    f.seek(offset)
     got = f.read(1)
-    assert got == bytes([0x39]), \
-        f'Patch 2 verify failed: {got.hex()}'
-    print('  Patch 2 (feature gate unlock) verified OK')
-print('  Both blob patches applied and verified')
+    assert got == bytes([0x39]), f'{label} patch 2 verify failed: {got.hex()}'
+
+with open('$SRC/rcblob_v2.x86_64', 'r+b') as f:
+    patch1_v2(f)
+    patch2(f, 0x6017c, 'v2')
+    n3 = patch3_stack_canary(f)
+print(f'  v2 blob (rcblob_v2.x86_64): patches 1-3 applied and verified ({n3} gs:[0x28] refs neutralized)')
+
+with open('$SRC/rcblob.x86_64', 'r+b') as f:
+    patch1_v1(f)
+    patch2(f, 0x5e959, 'v1')
+print('  v1 blob (rcblob.x86_64): both patches applied and verified')
 "
+
+echo "Linking selected blob for build: $BLOB_VERSION ($BLOB_FILE)"
+ln -sf "$BLOB_FILE" "$SRC/rcblob.x86_64.o"
 
 # ════════════════════════════════════════════════════════════════════
 # 4.  Patch C source and Makefile
@@ -179,8 +274,59 @@ sed -i 's/EXTRA_CFLAGS/ccflags-y/g' "$SRC/Makefile"
 sed -i 's/-outform DEV/-outform DER/g' "$SDK/mk_certs"
 sed -i 's|if \[ -f "/usr/src/linux-headers-\$KVERS/scripts/sign-file" \]; then|if [ -f "/usr/src/linux-headers-$KVERS/scripts/sign-file" ]; then\n\t\tSIGN_TOOL=/usr/src/linux-headers/$KVERS/scripts/sign-file\n\t    elif [ -f "/usr/src/kernels/$KVERS/scripts/sign-file" ]; then|g' "$SDK/mk_certs"
 
-# Makefile: replace blob-selection case with v2 symlink, remove redhat-release guards
-python3 - "$SRC/Makefile" << 'PYEOF'
+# rc_thunk_stubs.S — fallback Spectre mitigation thunks compiled in only
+# when the kernel lacks CONFIG_RETPOLINE/CONFIG_RETHUNK (pre_build.sh adds
+# rc_thunk_stubs.o to rcraid-objs only in that case). v2 was built with
+# -mindirect-branch=thunk-extern and -mfunction-return=thunk-extern; these
+# stubs provide direct jmp/ret so the module links on kernels that opt out
+# of Spectre mitigations. v1 (GCC 4.1.1) has no such flags and needs none.
+cat > "$SRC/rc_thunk_stubs.S" << 'THUNKEOF'
+/* rc_thunk_stubs.S — fallback retpoline thunks for CONFIG_RETPOLINE=n kernels.
+ * pre_build.sh adds rc_thunk_stubs.o to rcraid-objs only when the running
+ * kernel does not export these symbols. On standard Fedora/Debian kernels
+ * CONFIG_RETPOLINE=y and this file is not compiled in. */
+#include <linux/linkage.h>
+
+SYM_FUNC_START(__x86_return_thunk)
+	ret
+	int3
+SYM_FUNC_END(__x86_return_thunk)
+
+SYM_FUNC_START(__x86_indirect_thunk_rax)
+	jmp *%rax
+SYM_FUNC_END(__x86_indirect_thunk_rax)
+
+SYM_FUNC_START(__x86_indirect_thunk_rcx)
+	jmp *%rcx
+SYM_FUNC_END(__x86_indirect_thunk_rcx)
+
+SYM_FUNC_START(__x86_indirect_thunk_rdx)
+	jmp *%rdx
+SYM_FUNC_END(__x86_indirect_thunk_rdx)
+
+SYM_FUNC_START(__x86_indirect_thunk_r8)
+	jmp *%r8
+SYM_FUNC_END(__x86_indirect_thunk_r8)
+
+SYM_FUNC_START(__x86_indirect_thunk_r9)
+	jmp *%r9
+SYM_FUNC_END(__x86_indirect_thunk_r9)
+
+SYM_FUNC_START(__x86_indirect_thunk_r10)
+	jmp *%r10
+SYM_FUNC_END(__x86_indirect_thunk_r10)
+
+SYM_FUNC_START(__x86_indirect_thunk_r11)
+	jmp *%r11
+SYM_FUNC_END(__x86_indirect_thunk_r11)
+
+SYM_FUNC_START(__x86_indirect_thunk_r12)
+	jmp *%r12
+SYM_FUNC_END(__x86_indirect_thunk_r12)
+THUNKEOF
+
+# Makefile: replace blob-selection case with the selected blob's symlink, remove redhat-release guards
+python3 - "$SRC/Makefile" "$BLOB_FILE" << 'PYEOF'
 import re, sys
 
 with open(sys.argv[1]) as f:
@@ -188,7 +334,7 @@ with open(sys.argv[1]) as f:
 
 mk = re.sub(
     r'\t@case "\$\(KVERS\)".*?esac',
-    '\t@ln -sf rcblob_v2.x86_64 rcblob.x86_64.o',
+    f'\t@ln -sf {sys.argv[2]} rcblob.x86_64.o',
     mk, flags=re.DOTALL
 )
 mk = re.sub(
@@ -267,8 +413,30 @@ else
     sed -i 's/struct gendisk \*disk/struct block_device *bdev/g' rc_init.c
 fi
 
+# Retpoline thunk stubs: include rc_thunk_stubs.o only when the kernel
+# doesn't export __x86_return_thunk (CONFIG_RETPOLINE=n CONFIG_RETHUNK=n).
+# Check Module.symvers first; /proc/kallsyms as fallback.
+HAVE_THUNKS=false
+SYMVERS="/lib/modules/$KVER/build/Module.symvers"
+if grep -q "__x86_return_thunk" "$SYMVERS" 2>/dev/null; then
+    HAVE_THUNKS=true
+elif grep -q "__x86_return_thunk" /proc/kallsyms 2>/dev/null; then
+    HAVE_THUNKS=true
+fi
+if $HAVE_THUNKS; then
+    sed -i 's/ rc_thunk_stubs\.o//g' Makefile
+    echo "  Retpoline thunks provided by kernel — stubs not compiled"
+else
+    grep -q 'rc_thunk_stubs\.o' Makefile || \
+        sed -i 's/\(vers\.o\)/\1 rc_thunk_stubs.o/' Makefile
+    echo "  Retpoline thunks absent from kernel — adding rc_thunk_stubs.o"
+fi
+
 echo "pre_build.sh: done"
 PREBUILD
+# pre_build.sh is a quoted heredoc (its $KVER/$1/etc. must stay literal
+# until it runs later), so the blob symlink target is substituted here.
+sed -i "s/rcblob_v2\.x86_64/$BLOB_FILE/" "$SDK/pre_build.sh"
 chmod +x "$SDK/pre_build.sh"
 
 # ════════════════════════════════════════════════════════════════════
@@ -467,9 +635,10 @@ fi
 %changelog
 * Fri Mar 06 2026 Zero <zero@441.surf>
 - Unified build script (RPM + DEB)
-- v2 blob with two patches:
-  - 0xce4: CPUID identity (sub-type 0x03, correct product name/flags)
-  - 0x6017c: AND→CMP (RC_CoreFeatureSet stays 0xffff, all RAID levels)
+- Both v1 and v2 blobs patched identically (--blob=v1|v2 selects which
+  one is built in; default v2):
+  - CPUID identity (sub-type 0x03, correct product name/flags)
+  - AND→CMP feature-gate unlock (RC_CoreFeatureSet stays 0xffff, all RAID levels)
 - Shared DKMS lifecycle script (rcraid-dkms.sh)
 - pahole workaround with trap-based cleanup
 SPECEOF
