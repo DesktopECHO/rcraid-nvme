@@ -231,7 +231,7 @@ Notable hardening: CET/IBT landing pads (`endbr64`), retpoline indirect branches
 
 **Kernel compatibility caveats (v2).** Two compilation flags create problems on certain kernel configurations. (1) `-fstack-protector-strong` emits 477 `gs:[0x28]` accesses; on kernels built without `CONFIG_STACKPROTECTOR_STRONG` (e.g. custom builds on Linux ≥ 6.15 where `fixed_percpu_data` was removed), that address is unmapped and the first call into the blob faults. The stack canary patch neutralizes all 477 sites unconditionally. (2) `-mfunction-return=thunk-extern` and `-mindirect-branch=thunk-extern` require `__x86_return_thunk` / `__x86_indirect_thunk_*` symbols absent on `CONFIG_RETPOLINE=n CONFIG_RETHUNK=n` kernels; `rc_thunk_stubs.S` is compiled in conditionally. v1 (GCC 4.1.1, 2006) predates both features and is unaffected. See [Patches Applied](#patches-applied) and [Section 12](#12-known-patches-and-platform-notes).
 
-**v1 vs v2.** AMD ships two builds of the same Fulcrum source: `rcblob.x86_64` (v1) and `rcblob_v2.x86_64` (v2, described above). The upstream Makefile picks v2 only when `$(KVERS)` matches `*el10*` (RHEL 10) and falls back to v1 for every other kernel string. This project patches both blobs identically and lets `raidxpert2-install --blob=v1|v2` (default v2) choose which one is actually linked into the module.
+**v1 vs v2.** AMD ships two builds of the same Fulcrum source: `rcblob.x86_64` (v1) and `rcblob_v2.x86_64` (v2, described above). The upstream Makefile picks v2 only when `$(KVERS)` matches `*el10*` (RHEL 10) and falls back to v1 for every other kernel string. This project applies patches 1 and 2 to both blobs (v2 also gets patch 3, the stack-canary neutralization) and lets `raidxpert2-install --blob=v1|v2` (default v2) choose which one is actually linked into the module.
 
 | | v1 (`rcblob.x86_64`) | v2 (`rcblob_v2.x86_64`) |
 |---|---|---|
@@ -242,7 +242,7 @@ Notable hardening: CET/IBT landing pads (`endbr64`), retpoline indirect branches
 | Debug format | Pre-DWARF5 (`.debug_pubnames`, `.debug_loc`, `.debug_ranges`) | DWARF5 (`.debug_loclists`, `.debug_rnglists`, `.debug_line_str`) |
 | Global functions | 1,520 | 1,515 — 5 fewer as globals; folded into weak COMDAT sections instead (same code, just different linkage) |
 
-Functionally the two are identical: the same 7 `NVM_` NVMe symbols and the same 82 `RC_CMD_` management commands, byte-for-byte, exist in both. The differences are entirely toolchain and hardening generation, not RAID features — which is also why the same two binary patches apply to both blobs, just at different file offsets (see [Section 12](#12-known-patches-and-platform-notes)).
+Functionally the two are identical: the same 7 `NVM_` NVMe symbols and the same 82 `RC_CMD_` management commands, byte-for-byte, exist in both. The differences are entirely toolchain and hardening generation, not RAID features — which is also why patches 1 and 2 apply to both blobs (the same instructions exist in each, just at different file offsets; see [Section 12](#12-known-patches-and-platform-notes)).
 
 [↑ Back to top](#rcraid-nvme)
 
@@ -359,8 +359,8 @@ Additional array operations: mirror split/copy (detaching a mirror half as a sna
 
 | Platform | Characteristics |
 |---|---|
-| Ryzen APU (no Promontory) | No `NvmeTrapDeviceVar` EFI variable; NVMe drives appear as AMD `1022:b000` (invisible to Linux without rcraid — see [Section 1](#1-apu-feature-set-is-degraded-in-linux)); both blob patches required; CPUID maps to restrictive sub-type without Patch 1; no hardware RAID key (EEPROM absent); vendor shows as "UNKNOWN" in management UI. Tested on MinisForum UM890 Pro (Ryzen 9 8945HS). |
-| Promontory Chipset | EFI firmware populates `NvmeTrapDeviceVar` with original drive VIDs; the wrapper's `RC_Unmap_VidDid` resolves trapped devices; only Patch 2 (feature gate) may be needed depending on CPUID sub-type mapping |
+| Ryzen APU (no Promontory) | No `NvmeTrapDeviceVar` EFI variable; NVMe drives appear as AMD `1022:b000` (invisible to Linux without rcraid — see [Section 1](#1-apu-feature-set-is-degraded-in-linux)); Patches 1 and 2 required; CPUID maps to restrictive sub-type without Patch 1; no hardware RAID key (EEPROM absent); vendor shows as "UNKNOWN" in management UI. Tested on MinisForum UM890 Pro (Ryzen 9 8945HS). |
+| Promontory Chipset | EFI firmware populates `NvmeTrapDeviceVar` with original drive VIDs; the wrapper's `RC_Unmap_VidDid` resolves trapped devices. Patches 1 and 2 are still applied (the blob is patched at install time regardless of platform), but the CPUID sub-type mapping may already permit RAID here without Patch 1. |
 | Discrete RAID Cards | Full hardware support: battery/NVRAM for write-back cache, 1-Wire EEPROM for licensing, SGPIO for enclosure LEDs, SAS expanders, buzzer/alarm. No binary patches needed — hardware license key enables features natively |
 
 [↑ Back to top](#rcraid-nvme)
@@ -368,7 +368,7 @@ Additional array operations: mirror split/copy (detaching a mirror half as a sna
 ## Development
 
 - **`raidxpert2-install`** — Unified build script that detects RPM/DEB distributions and builds the appropriate package. Extracts the upstream RPM, patches both the v1 and v2 blobs (`--blob=v1|v2` selects which is linked in, default v2), writes DKMS metadata, distro-specific initramfs assets, and the shared lifecycle script. Generates the package, installs it, then enters the live-CD flow: polls for the installer's target mount (Anaconda `/mnt/sysroot/` for RPM, Calamares `/tmp/calamares-root-*/` for DEB), copies the package, and chroots in to install it on the new system.
-- **`pre_build.sh`** — DKMS `PRE_BUILD` hook; runs before every `dkms build`. Applies kernel-version-gated source patches (timer API ≥ 6.13, bios_param ≥ 6.18) and the pahole workaround (≤ 6.12). Symlinks the selected blob as `rcblob.x86_64.o`.
+- **`pre_build.sh`** — DKMS `PRE_BUILD` hook; runs before every `dkms build`. Applies kernel-version-gated source patches (timer API ≥ 6.13, bios_param ≥ 6.18) and the pahole workaround (≤ 6.12), and links `rc_thunk_stubs.o` into the module only when the kernel does not export `__x86_return_thunk` (`CONFIG_RETPOLINE=n CONFIG_RETHUNK=n`). Symlinks the selected blob as `rcblob.x86_64.o`.
 - **`rcraid-dkms.sh`** — Shared DKMS lifecycle handler called by both RPM `%post`/`%preun` and DEB `postinst`/`prerm`. Handles `dkms add/build/install`, module loading, and initramfs regeneration (auto-detects dracut vs update-initramfs). Eliminates duplicated post-install logic between the two package formats.
 
 ## Words of Warning
